@@ -146,6 +146,8 @@ real `gpt-4o-mini` personas with provenance. It refuses to run unless
 
 ```
 # .env additions for the run process (backend + simulation scripts):
+ZEP_MODE=local
+ZEP_BASE_URL=http://localhost:8000/api/v2
 MIROFISH_LLM_LANGUAGE=en
 # LLM_API_KEY / LLM_BASE_URL / LLM_MODEL_NAME=gpt-4o-mini already configured
 ```
