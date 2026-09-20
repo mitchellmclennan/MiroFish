@@ -15,6 +15,7 @@ from enum import Enum
 from ..config import Config
 from ..utils.logger import get_logger
 from .zep_entity_reader import ZepEntityReader, FilteredEntities
+from .entity_quality_filter import filter_entities_for_profiles
 from .oasis_profile_generator import OasisProfileGenerator, OasisAgentProfile
 from .simulation_config_generator import SimulationConfigGenerator, SimulationParameters
 from ..utils.locale import t
@@ -319,8 +320,34 @@ class SimulationManager:
                 self._save_simulation_state(state)
                 raise ValueError(state.error)
             
+            # ========== 阶段1.5: 实体质量过滤（人设生成前清洗垃圾实体） ==========
+            quality_report = filter_entities_for_profiles(filtered.entities)
+            usable_entities = quality_report.kept
+            
+            # 写入质量过滤报告，便于人工审计哪些实体被剔除/重标
+            try:
+                with open(
+                    os.path.join(sim_dir, "entity_quality_report.json"),
+                    'w', encoding='utf-8'
+                ) as f:
+                    json.dump(quality_report.to_dict(), f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.warning(f"保存实体质量过滤报告失败: {e}")
+            
+            usable_types = sorted({
+                e.get_entity_type() or "Unknown" for e in usable_entities
+            })
+            state.entities_count = len(usable_entities)
+            state.entity_types = usable_types
+            
+            if not usable_entities:
+                state.status = SimulationStatus.FAILED
+                state.error = "质量过滤后没有可用的实体（全部被判定为垃圾实体，详见entity_quality_report.json）"
+                self._save_simulation_state(state)
+                raise ValueError(state.error)
+            
             # ========== 阶段2: 生成Agent Profile ==========
-            total_entities = len(filtered.entities)
+            total_entities = len(usable_entities)
             
             if progress_callback:
                 progress_callback(
@@ -355,13 +382,14 @@ class SimulationManager:
                 realtime_platform = "twitter"
             
             profiles = generator.generate_profiles_from_entities(
-                entities=filtered.entities,
+                entities=usable_entities,
                 use_llm=use_llm_for_profiles,
                 progress_callback=profile_progress,
                 graph_id=state.graph_id,  # 传入graph_id用于Zep检索
                 parallel_count=parallel_profile_count,  # 并行生成数量
                 realtime_output_path=realtime_output_path,  # 实时保存路径
-                output_platform=realtime_platform  # 输出格式
+                output_platform=realtime_platform,  # 输出格式
+                provenance_output_path=os.path.join(sim_dir, "persona_provenance.json")
             )
             
             state.profiles_count = len(profiles)
@@ -426,7 +454,7 @@ class SimulationManager:
                 graph_id=state.graph_id,
                 simulation_requirement=simulation_requirement,
                 document_text=document_text,
-                entities=filtered.entities,
+                entities=usable_entities,
                 enable_twitter=state.enable_twitter,
                 enable_reddit=state.enable_reddit
             )

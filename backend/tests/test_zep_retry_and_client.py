@@ -100,7 +100,8 @@ def test_zep_client_uses_internal_timeout_and_ignores_env_overrides(monkeypatch)
         "timeout": zep.ZEP_HTTP_REQUEST_TIMEOUT_SECONDS,
     }]
     assert zep.ZEP_HTTP_REQUEST_TIMEOUT_SECONDS == 60.0
-    assert zep.ZEP_INGESTION_WAIT_TIMEOUT_SECONDS == 600
+    # OpenZep本地试验：抽取较慢，等待窗口从600s放宽到7200s
+    assert zep.ZEP_INGESTION_WAIT_TIMEOUT_SECONDS == 7200
     zep.clear_zep_client_cache()
 
 

@@ -11,6 +11,7 @@ from flask import request, jsonify, send_file
 from . import simulation_bp
 from ..config import Config
 from ..services.zep_entity_reader import ZepEntityReader
+from ..services.entity_quality_filter import filter_entities_for_profiles
 from ..services.oasis_profile_generator import OasisProfileGenerator
 from ..services.simulation_manager import SimulationManager, SimulationStatus
 from ..services.simulation_runner import (
@@ -1464,9 +1465,12 @@ def generate_profiles():
                 "error": t('api.noMatchingEntities')
             }), 400
         
+        # 人设生成前过滤垃圾实体（法规、错标产品/公司、样板碎片等）
+        quality_report = filter_entities_for_profiles(filtered.entities)
+        
         generator = OasisProfileGenerator()
         profiles = generator.generate_profiles_from_entities(
-            entities=filtered.entities,
+            entities=quality_report.kept,
             use_llm=use_llm
         )
         
@@ -1483,7 +1487,14 @@ def generate_profiles():
                 "platform": platform,
                 "entity_types": list(filtered.entity_types),
                 "count": len(profiles_data),
-                "profiles": profiles_data
+                "profiles": profiles_data,
+                "entity_quality": {
+                    "kept_count": len(quality_report.kept),
+                    "dropped_count": len(quality_report.dropped),
+                    "relabeled_count": len(quality_report.relabeled),
+                    "dropped": [d.to_dict() for d in quality_report.dropped],
+                    "relabeled": [d.to_dict() for d in quality_report.relabeled],
+                }
             }
         })
         

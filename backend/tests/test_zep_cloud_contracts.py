@@ -1,9 +1,7 @@
 from types import SimpleNamespace
 import json
 
-import httpx
 import pytest
-from zep_cloud import Zep
 from zep_cloud.core.api_error import ApiError as ZepApiError
 
 from app.services import graph_builder as graph_builder_module
@@ -189,27 +187,40 @@ def test_episode_processing_timeout_fails_instead_of_reporting_success(monkeypat
         builder._wait_for_episodes(["episode-1"], timeout=1)
 
 
-def test_document_ingestion_uses_current_batch_api_and_persists_identity():
-    calls = []
+def test_document_ingestion_uses_openzep_graph_batch_and_persists_identity(monkeypatch):
+    """OpenZep本地试验路径：chunk直接POST到/graph-batch并跟踪episode uuid。
 
-    class BatchApi:
-        def create(self, **kwargs):
-            calls.append(("create", kwargs))
-            return SimpleNamespace(batch_id="batch-1")
+    Zep Cloud的client.batch.*不被本地OpenZep服务实现；该测试锁定
+    /graph-batch直传路径的关键契约（确定性operation id、回调、
+    episode uuid回收与数量校验）。
+    """
+    requests_seen = []
 
-        def add(self, **kwargs):
-            calls.append(("add", kwargs))
-            return [
-                SimpleNamespace(episode_uuid=f"episode-{index}")
-                for index, _item in enumerate(kwargs["items"])
-            ]
+    class _FakeResponse:
+        def __init__(self, body):
+            self._body = body
 
-        def process(self, **kwargs):
-            calls.append(("process", kwargs))
-            return SimpleNamespace(status="queued")
+        def read(self):
+            return json.dumps(self._body).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        requests_seen.append(req)
+        episodes = [
+            {"uuid_": f"episode-{index}", "name": f"chunk-{index}"}
+            for index in range(len(json.loads(req.data)["episodes"]))
+        ]
+        return _FakeResponse({"episodes": episodes})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
 
     builder = object.__new__(GraphBuilderService)
-    builder.client = SimpleNamespace(batch=BatchApi())
+    builder.client = SimpleNamespace(batch=SimpleNamespace())
     persisted = []
 
     submission = builder.add_text_batches(
@@ -220,18 +231,55 @@ def test_document_ingestion_uses_current_batch_api_and_persists_identity():
         ),
     )
 
-    assert submission.batch_id == "batch-1"
-    assert submission.item_count == 2
-    assert len(submission.operation_id) == 64
-    assert persisted == [
-        (None, submission.operation_id),
-        ("batch-1", submission.operation_id),
+    from app.utils.zep import ZEP_CLOUD_BASE_URL
+
+    assert len(requests_seen) == 1
+    request = requests_seen[0]
+    assert request.full_url == ZEP_CLOUD_BASE_URL + "/graph-batch"
+    payload = json.loads(request.data)
+    assert payload["graph_id"] == "graph-id"
+    assert [episode["data"] for episode in payload["episodes"]] == [
+        "chunk one",
+        "chunk two",
     ]
-    assert [name for name, _kwargs in calls] == ["create", "add", "process"]
-    items = calls[1][1]["items"]
-    assert [item.type for item in items] == ["graph_episode", "graph_episode"]
-    assert all(item.graph_id == "graph-id" for item in items)
-    assert all(item.data_type == "text" for item in items)
+    assert all(episode["type"] == "text" for episode in payload["episodes"])
+
+    assert submission.batch_id == f"openzep-{submission.operation_id}"
+    assert submission.item_count == 2
+    assert submission.episode_uuids == ["episode-0", "episode-1"]
+    assert len(submission.operation_id) == 64
+    # 新路径在POST前用确定性ID一次性journal，便于事后对账
+    assert persisted == [
+        (f"openzep-{submission.operation_id}", submission.operation_id)
+    ]
+
+
+def test_document_ingestion_rejects_missing_openzep_episode_uuids(monkeypatch):
+    """OpenZep返回的episode uuid数量不足时必须显式失败，不能静默成功。"""
+
+    class _FakeResponse:
+        def __init__(self, body):
+            self._body = body
+
+        def read(self):
+            return json.dumps(self._body).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        return _FakeResponse({"episodes": [{"uuid_": "episode-0"}]})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    builder = object.__new__(GraphBuilderService)
+    builder.client = SimpleNamespace(batch=SimpleNamespace())
+
+    with pytest.raises(RuntimeError, match="episode uuids"):
+        builder.add_text_batches("graph-id", ["chunk one", "chunk two"])
 
 
 def test_graph_create_persists_identity_before_post_and_reconciles_timeout():
@@ -263,239 +311,133 @@ def test_graph_create_persists_identity_before_post_and_reconciles_timeout():
     ]
 
 
-def test_batch_create_timeout_is_reconciled_by_operation_metadata(monkeypatch):
-    calls = []
-    list_count = 0
+def test_batch_wait_collects_processed_episodes_and_keeps_polling(monkeypatch):
+    """OpenZep本地路径：_wait_for_batch轮询/graph/episodes/{uuid}直到processed。"""
+    poll_paths = []
+    outcomes = {
+        "episode-1": iter([False, True]),
+        "episode-2": iter([True]),
+    }
 
-    class BatchApi:
-        def create(self, **_kwargs):
-            calls.append("create")
-            raise TimeoutError("response lost")
+    class _FakeResponse:
+        def __init__(self, body):
+            self._body = json.dumps(body).encode("utf-8")
 
-        def list(self, **_kwargs):
-            nonlocal list_count
-            calls.append("list")
-            list_count += 1
-            if list_count == 1:
-                return SimpleNamespace(batches=[], next_cursor=None)
-            return SimpleNamespace(
-                batches=[SimpleNamespace(
-                    batch_id="batch-recovered",
-                    metadata={
-                        "mirofish_operation_id": GraphBuilderService.build_operation_id(
-                            "graph-id", ["chunk"]
-                        ),
-                        "graph_id": "graph-id",
-                    },
-                )],
-                next_cursor=None,
-            )
+        def read(self):
+            return self._body
 
-        def add(self, **kwargs):
-            calls.append("add")
-            return [SimpleNamespace(episode_uuid="episode-1")]
+        def __enter__(self):
+            return self
 
-        def process(self, **_kwargs):
-            calls.append("process")
-            return SimpleNamespace(status="queued")
+        def __exit__(self, *_exc):
+            return False
 
-    builder = object.__new__(GraphBuilderService)
-    builder.client = SimpleNamespace(batch=BatchApi())
+    def fake_urlopen(req, timeout=None):
+        path = req.full_url.rsplit("/", 1)[-1]
+        poll_paths.append(path)
+        # episode-1首轮未完成，第二轮完成；episode-2首轮即完成
+        done = next(outcomes[path])
+        return _FakeResponse({"processed": done})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
     monkeypatch.setattr(graph_builder_module.time, "sleep", lambda _seconds: None)
 
-    submission = builder.add_text_batches("graph-id", ["chunk"])
-
-    assert submission.batch_id == "batch-recovered"
-    assert calls == ["create", "list", "list", "add", "process"]
-
-
-def test_batch_add_timeout_recovers_a_fully_accepted_group_without_replay(monkeypatch):
-    add_calls = []
-    list_calls = []
-
-    class BatchApi:
-        def create(self, **_kwargs):
-            return SimpleNamespace(batch_id="batch-1")
-
-        def add(self, **_kwargs):
-            add_calls.append(True)
-            raise TimeoutError("response lost")
-
-        def list_items(self, **_kwargs):
-            list_calls.append(True)
-            if len(list_calls) == 1:
-                return SimpleNamespace(items=[], next_cursor=None)
-            return SimpleNamespace(
-                items=[
-                    SimpleNamespace(sequence_index=0, episode_uuid="episode-1"),
-                    SimpleNamespace(sequence_index=1, episode_uuid="episode-2"),
-                ],
-                next_cursor=None,
-            )
-
-        def process(self, **_kwargs):
-            return SimpleNamespace(status="queued")
-
     builder = object.__new__(GraphBuilderService)
-    builder.client = SimpleNamespace(batch=BatchApi())
-    monkeypatch.setattr(graph_builder_module.time, "sleep", lambda _seconds: None)
+    builder.client = SimpleNamespace(batch=SimpleNamespace())
+    submission = BatchSubmission("batch-1", "operation", ["episode-1", "episode-2"], 2)
 
-    submission = builder.add_text_batches(
-        "graph-id", ["chunk one", "chunk two"]
-    )
-
-    assert submission.item_count == 2
-    assert add_calls == [True]
-    assert len(list_calls) == 2
-
-
-def test_batch_wait_validates_terminal_items_and_opaque_zero_cursor():
-    list_calls = []
-
-    class BatchApi:
-        def get(self, **_kwargs):
-            return SimpleNamespace(
-                status="succeeded",
-                progress=SimpleNamespace(
-                    percent_complete=100,
-                    succeeded_items=2,
-                ),
-            )
-
-        def list_items(self, **kwargs):
-            list_calls.append(kwargs)
-            if kwargs["cursor"] is None:
-                return SimpleNamespace(
-                    items=[SimpleNamespace(
-                        sequence_index=0,
-                        status="succeeded",
-                        episode_uuid="episode-1",
-                        source_uuid="episode-1",
-                    )],
-                    next_cursor=0,
-                )
-            return SimpleNamespace(
-                items=[SimpleNamespace(
-                    sequence_index=1,
-                    status="succeeded",
-                    episode_uuid="episode-2",
-                    source_uuid="episode-2",
-                )],
-                next_cursor=None,
-            )
-
-    builder = object.__new__(GraphBuilderService)
-    builder.client = SimpleNamespace(batch=BatchApi())
-    submission = BatchSubmission("batch-1", "operation", [], 2)
-
-    assert builder._wait_for_batch(submission, timeout=1) == [
-        "episode-1",
-        "episode-2",
-    ]
-    assert [call["cursor"] for call in list_calls] == [None, 0]
+    # 返回顺序为完成顺序：episode-2首轮完成，episode-1第二轮完成
+    assert builder._wait_for_batch(submission, timeout=30) == ["episode-2", "episode-1"]
+    # pending是set，轮询顺序不定，只断言次数
+    assert poll_paths.count("episode-1") == 2
+    assert poll_paths.count("episode-2") == 1
+    assert len(poll_paths) == 3
 
 
-@pytest.mark.parametrize("status", ["partial", "failed", "invalid", "canceled"])
-def test_batch_non_success_terminal_states_fail(status):
-    builder = object.__new__(GraphBuilderService)
-    builder.client = SimpleNamespace(
-        batch=SimpleNamespace(
-            get=lambda **_kwargs: SimpleNamespace(status=status, progress=None),
-            list_items=lambda **_kwargs: SimpleNamespace(
-                items=[SimpleNamespace(status="failed", error={"message": "bad"})],
-                next_cursor=None,
-            ),
-        )
-    )
+def test_batch_wait_times_out_while_episodes_stay_unprocessed(monkeypatch):
+    class _FakeResponse:
+        def __init__(self, body):
+            self._body = json.dumps(body).encode("utf-8")
 
-    with pytest.raises(RuntimeError, match=status):
-        builder._wait_for_batch(
-            BatchSubmission("batch-1", "operation", [], 1),
-            timeout=1,
-        )
+        def read(self):
+            return self._body
 
+        def __enter__(self):
+            return self
 
-def test_batch_wait_times_out_while_status_remains_nonterminal(monkeypatch):
-    builder = object.__new__(GraphBuilderService)
-    builder.client = SimpleNamespace(
-        batch=SimpleNamespace(
-            get=lambda **_kwargs: SimpleNamespace(status="processing", progress=None)
-        )
-    )
+        def __exit__(self, *_exc):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        return _FakeResponse({"processed": False})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
     timestamps = iter([0.0, 2.0])
     monkeypatch.setattr(graph_builder_module.time, "time", lambda: next(timestamps))
     monkeypatch.setattr(graph_builder_module.time, "sleep", lambda _seconds: None)
 
+    builder = object.__new__(GraphBuilderService)
+    builder.client = SimpleNamespace(batch=SimpleNamespace())
+
     with pytest.raises(TimeoutError, match="batch-1"):
         builder._wait_for_batch(
-            BatchSubmission("batch-1", "operation", [], 1),
+            BatchSubmission("batch-1", "operation", ["episode-1"], 1),
             timeout=1,
         )
 
 
-def test_installed_sdk_serializes_the_batch_325_contract():
-    requests = []
+def test_openzep_trial_wire_contract_for_ingestion_and_wait(monkeypatch):
+    """锁定OpenZep本地试验路径的线上契约：/graph-batch直传 + episode轮询。"""
+    from app.utils.zep import ZEP_CLOUD_BASE_URL
 
-    def handler(request):
-        requests.append((request.method, request.url.path, request.content))
-        path = request.url.path
-        if path.endswith("/batches") and request.method == "POST":
-            return httpx.Response(
-                200,
-                json={"batch_id": "batch-1", "status": "draft", "item_count": 0},
-            )
-        if path.endswith("/batches/batch-1/items") and request.method == "POST":
-            return httpx.Response(200, json=[{
-                "item_id": "item-1",
-                "sequence_index": 0,
-                "status": "pending",
-                "episode_uuid": "episode-1",
-                "source_uuid": "episode-1",
-            }])
-        if path.endswith("/batches/batch-1/process"):
-            return httpx.Response(
-                200,
-                json={"batch_id": "batch-1", "status": "queued", "item_count": 1},
-            )
-        if path.endswith("/batches/batch-1"):
-            return httpx.Response(200, json={
-                "batch_id": "batch-1",
-                "status": "succeeded",
-                "item_count": 1,
-                "progress": {"percent_complete": 100, "succeeded_items": 1},
-            })
-        if path.endswith("/batches/batch-1/items") and request.method == "GET":
-            return httpx.Response(200, json={
-                "items": [{
-                    "item_id": "item-1",
-                    "sequence_index": 0,
-                    "status": "succeeded",
-                    "episode_uuid": "episode-1",
-                    "source_uuid": "episode-1",
-                }],
-                "next_cursor": None,
-            })
-        raise AssertionError(f"Unexpected request: {request.method} {path}")
+    requests_seen = []
 
-    with httpx.Client(transport=httpx.MockTransport(handler)) as transport_client:
-        builder = object.__new__(GraphBuilderService)
-        builder.client = Zep(api_key="test-key", httpx_client=transport_client)
-        submission = builder.add_text_batches("graph-id", ["source chunk"])
-        assert builder._wait_for_batch(submission, timeout=1) == ["episode-1"]
+    class _FakeResponse:
+        def __init__(self, body):
+            self._body = json.dumps(body).encode("utf-8")
 
-    assert [(method, path) for method, path, _body in requests] == [
-        ("POST", "/api/v2/batches"),
-        ("POST", "/api/v2/batches/batch-1/items"),
-        ("POST", "/api/v2/batches/batch-1/process"),
-        ("GET", "/api/v2/batches/batch-1"),
-        ("GET", "/api/v2/batches/batch-1/items"),
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        method = req.get_method()
+        path = req.full_url.replace(ZEP_CLOUD_BASE_URL, "")
+        requests_seen.append((method, path, req.data))
+
+        if method == "POST" and path == "/graph-batch":
+            return _FakeResponse({"episodes": [{"uuid_": "episode-1"}]})
+        if method == "GET" and path == "/graph/episodes/episode-1":
+            return _FakeResponse({"processed": True})
+        raise AssertionError(f"Unexpected request: {method} {path}")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(graph_builder_module.time, "sleep", lambda _seconds: None)
+
+    builder = object.__new__(GraphBuilderService)
+    builder.client = SimpleNamespace(batch=SimpleNamespace())
+
+    submission = builder.add_text_batches("graph-id", ["source chunk"])
+    assert builder._wait_for_batch(submission, timeout=1) == ["episode-1"]
+
+    assert [(method, path) for method, path, _body in requests_seen] == [
+        ("POST", "/graph-batch"),
+        ("GET", "/graph/episodes/episode-1"),
     ]
-    add_payload = json.loads(requests[1][2])
-    assert add_payload["items"][0] == {
-        "data": "source chunk",
-        "data_type": "text",
+    batch_payload = json.loads(requests_seen[0][2])
+    assert batch_payload == {
         "graph_id": "graph-id",
-        "metadata": add_payload["items"][0]["metadata"],
-        "source_description": "MiroFish source document chunk",
-        "type": "graph_episode",
+        "episodes": [
+            {
+                "name": f"{submission.operation_id}-0",
+                "data": "source chunk",
+                "type": "text",
+                "source_description": "MiroFish source document chunk",
+            }
+        ],
     }
