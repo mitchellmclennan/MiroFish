@@ -131,6 +131,35 @@ no LLM cost) drops or fixes, before any profile is generated:
 - **low-information entities** — no summary, no attributes, and no
   related edges: nothing to ground a persona on.
 
+### Duplicate-speaker guard (prepare level)
+
+The fresh NeoLife graph extracted the same organization twice — `NeoLife`
+and `NeoLife Official` — and each extraction produced its own agent
+persona, so one real-world entity spoke twice in the simulation. The
+prepare pipeline (`filter_entities_for_profiles`, applied by both
+`prepare_simulation` and `POST /api/simulation/generate-profiles`) now
+keeps **one speaker per normalized entity identity**:
+
+- identity normalization is deliberately conservative: case folding and
+  whitespace folding only (`neolife` ≡ `NeoLife`); punctuation variants
+  (`Neo-Life`) are **not** merged — the guard must not conflate unrelated
+  aliases;
+- a closed, documented list of trailing *account-designator* words —
+  `official`, `official account`, `official page`, as a separate final
+  word — is stripped before matching (`NeoLife Official` → `neolife`,
+  merging with `NeoLife`). The list deliberately excludes `team`, `labs`,
+  `group`, … which could be parts of distinct entity names; glued words
+  (`BarOfficial`) are never stripped;
+- among a group of duplicates the **richest** entity is kept (most related
+  edges, then related nodes, then summary length, then attributes; ties
+  go to the earliest input order) — fully deterministic;
+- every merge is audited: `entity_quality_report.json` and the
+  `/generate-profiles` response carry a `merged` block
+  (`merged_count` + per-merge `entity_name` / `kept_name` / `identity` /
+  `reason: duplicate_speaker_identity`);
+- this is a correctness guard, not a quality heuristic: it **still runs**
+  when `MIROFISH_ENTITY_QUALITY_FILTER=0` disables the junk filter.
+
 Legitimate organizations are kept **when they carry an organization
 label** — including lowercase names like `neolife`. An *untyped*
 lowercase name (`neolife` labeled `ExtractedEntity`) is still treated as

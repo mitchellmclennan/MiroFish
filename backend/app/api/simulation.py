@@ -1445,6 +1445,11 @@ def generate_profiles():
         - 人设生成前会应用实体质量过滤（可用MIROFISH_ENTITY_QUALITY_FILTER=0关闭）；
           过滤剔除全部实体时返回400（success:false）并附entity_quality报告，
           不会静默返回空人设列表；
+        - 人设生成前还会执行重复发言主体去重：同一归一化身份（大小写/空白折叠，
+          外加封闭的"official"账号指代后缀）只保留一个发言主体——图谱提取常把
+          同一实体抽出多份（如"NeoLife"+"NeoLife Official"），不去重会导致同一
+          现实主体在模拟中多次发言。这是正确性守卫，质量过滤关闭时仍然执行；
+          合并详情见返回的entity_quality.merged块（含保留者与被合并者名称）；
         - 返回的entity_types是过滤后实际生成人设的实体类型；被剔除实体的
           类型和原因见entity_quality块。
     """
@@ -1493,8 +1498,10 @@ def generate_profiles():
                         "kept_count": 0,
                         "dropped_count": len(quality_report.dropped),
                         "relabeled_count": len(quality_report.relabeled),
+                        "merged_count": len(quality_report.merged),
                         "dropped": [d.to_dict() for d in quality_report.dropped],
                         "relabeled": [d.to_dict() for d in quality_report.relabeled],
+                        "merged": [m.to_dict() for m in quality_report.merged],
                     }
                 }
             }), 400
@@ -1529,8 +1536,10 @@ def generate_profiles():
                     "kept_count": len(quality_report.kept),
                     "dropped_count": len(quality_report.dropped),
                     "relabeled_count": len(quality_report.relabeled),
+                    "merged_count": len(quality_report.merged),
                     "dropped": [d.to_dict() for d in quality_report.dropped],
                     "relabeled": [d.to_dict() for d in quality_report.relabeled],
+                    "merged": [m.to_dict() for m in quality_report.merged],
                 }
             }
         })

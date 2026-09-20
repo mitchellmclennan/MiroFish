@@ -4,6 +4,12 @@ Statutes, products/companies mislabeled as people, boilerplate fragments,
 empty names and low-information entities must not become personas.
 Legitimate companies stay as organizations (relabelled when they were
 mislabeled as people).
+
+The prepare-level pipeline (``filter_entities_for_profiles``) additionally
+dedupes duplicate speakers: one agent persona per normalized entity
+identity ("NeoLife" + "NeoLife Official" extracted as two entities must
+not become two speakers), while deliberately never merging unrelated
+aliases.
 """
 
 import pytest
@@ -457,3 +463,210 @@ class TestFilterIntegrationContract:
     def test_filtering_enabled_by_default(self, monkeypatch):
         monkeypatch.delenv("MIROFISH_ENTITY_QUALITY_FILTER", raising=False)
         assert is_entity_quality_filter_enabled()
+
+    def test_pure_quality_filter_does_not_dedupe(self):
+        """边界：EntityQualityFilter只做质量决策；"Marcus R."与"marcus r."
+        两个实体都保留（去重属于prepare级管道，filter_entities_for_profiles）。
+        """
+        entities = [
+            _entity("Marcus R.", ["Person", "Entity"], summary="An order was drafted."),
+            _entity("marcus r.", ["ExtractedEntity", "Entity"], summary="An order was drafted."),
+        ]
+        report = EntityQualityFilter().filter_entities(entities)
+        assert {e.name for e in report.kept} == {"Marcus R.", "marcus r."}
+        assert report.merged == []
+
+
+class TestDuplicateSpeakerDedupe:
+    """prepare级重复发言主体守卫：同一归一化身份只保留一个发言主体。
+
+    真实NeoLife图谱把同一组织抽成了"NeoLife"与"NeoLife Official"两个
+    实体，各自生成了一个Agent人设，导致同一现实主体在模拟中重复发言。
+    """
+
+    def test_neolife_and_neolife_official_merge_into_one_speaker(self):
+        entities = [
+            _entity(
+                "NeoLife",
+                ["Organization", "Entity"],
+                summary="Fulfillment infrastructure.",
+                related_edges=[{"fact": "NeoLife ships orders.", "direction": "outgoing"}],
+            ),
+            _entity(
+                "NeoLife Official",
+                ["Organization", "Entity"],
+                summary="Official account.",
+                related_edges=[],
+            ),
+        ]
+        report = filter_entities_for_profiles(entities)
+
+        assert len(report.kept) == 1
+        assert report.kept[0].name == "NeoLife"
+        assert len(report.merged) == 1
+        merged = report.merged[0]
+        assert merged.entity_name == "NeoLife Official"
+        assert merged.kept_name == "NeoLife"
+        assert merged.identity == "neolife"
+        assert merged.reason == "duplicate_speaker_identity"
+
+    def test_case_and_whitespace_folded_duplicates_merge(self):
+        entities = [
+            _entity("neolife", ["Organization", "Entity"], summary="a"),
+            _entity("NeoLife", ["Organization", "Entity"], summary="b"),
+            _entity(" NeoLife  ", ["Organization", "Entity"], summary="c"),
+        ]
+        report = filter_entities_for_profiles(entities)
+
+        assert len(report.kept) == 1
+        assert len(report.merged) == 2
+
+    def test_richest_entity_is_kept_regardless_of_input_order(self):
+        thin = _entity(
+            "NeoLife",
+            ["Organization", "Entity"],
+            # 有摘要才会通过低信息过滤——这里隔离测试的是去重的选择规则
+            summary="Some context.",
+        )
+        rich = _entity(
+            "NeoLife Official",
+            ["Organization", "Entity"],
+            summary="Official account of NeoLife.",
+            related_edges=[
+                {"fact": "NeoLife Official posts pricing updates.", "direction": "outgoing"},
+                {"fact": "NeoLife Official replies to clinics.", "direction": "outgoing"},
+            ],
+        )
+        report = filter_entities_for_profiles([thin, rich])
+        assert report.kept[0].name == "NeoLife Official"
+        assert report.merged[0].entity_name == "NeoLife"
+
+        # 信息量相同时平局取输入序最前者（完全确定）
+        equal_one = _entity("NeoLife", ["Organization", "Entity"], summary="same")
+        equal_two = _entity("NeoLife Official", ["Organization", "Entity"], summary="same")
+        report = filter_entities_for_profiles([equal_one, equal_two])
+        assert report.kept[0].name == "NeoLife"
+        assert report.merged[0].entity_name == "NeoLife Official"
+
+    def test_kept_order_follows_input_order(self):
+        entities = [
+            _entity("Marcus R.", ["Person", "Entity"], summary="a"),
+            _entity("NeoLife", ["Organization", "Entity"], summary="b"),
+            _entity("marcus r.", ["ExtractedEntity", "Entity"], summary="c"),
+        ]
+        report = filter_entities_for_profiles(entities)
+        assert [e.name for e in report.kept] == ["Marcus R.", "NeoLife"]
+
+    def test_unrelated_aliases_are_never_merged(self):
+        """身份合并刻意保守：不同品牌拼写/后缀词不得混为一谈。"""
+        entities = [
+            _entity("NeoLife", ["Organization", "Entity"], summary="a"),
+            _entity("Neo", ["Organization", "Entity"], summary="b"),
+            _entity("NeoLife Labs", ["Organization", "Entity"], summary="c"),
+            _entity("Neo-Life", ["Organization", "Entity"], summary="d"),
+            _entity("NeoLife Team", ["Organization", "Entity"], summary="e"),
+            _entity("BarOfficial", ["Organization", "Entity"], summary="f"),
+        ]
+        report = filter_entities_for_profiles(entities)
+
+        assert len(report.kept) == len(entities)
+        assert report.merged == []
+
+    def test_glued_official_suffix_is_not_stripped(self):
+        """后缀必须是独立结尾词："BarOfficial"（粘连词）不剥离、不与
+        "Bar"合并；"X Official"（独立词）才剥离。"""
+        entities = [
+            _entity("Bar", ["Organization", "Entity"], summary="a"),
+            _entity("BarOfficial", ["Organization", "Entity"], summary="b"),
+        ]
+        report = filter_entities_for_profiles(entities)
+        assert len(report.kept) == 2
+        assert report.merged == []
+
+        entities = [
+            _entity("Bar", ["Organization", "Entity"], summary="a"),
+            _entity("Bar Official", ["Organization", "Entity"], summary="b"),
+        ]
+        report = filter_entities_for_profiles(entities)
+        assert len(report.kept) == 1
+        assert report.merged[0].entity_name == "Bar Official"
+
+    def test_official_account_and_page_suffixes_all_group(self):
+        entities = [
+            _entity("NeoLife", ["Organization", "Entity"], summary="a"),
+            _entity("NeoLife Official", ["Organization", "Entity"], summary="b"),
+            _entity("NeoLife Official Account", ["Organization", "Entity"], summary="c"),
+            _entity("NeoLife Official Page", ["Organization", "Entity"], summary="d"),
+        ]
+        report = filter_entities_for_profiles(entities)
+        assert len(report.kept) == 1
+        assert len(report.merged) == 3
+
+    def test_suffix_only_name_is_not_merged_with_unrelated_entity(self):
+        """纯后缀名"Official"保持原样：不与"Bar"合并，只与同名实体合并。"""
+        entities = [
+            _entity("Bar", ["Organization", "Entity"], summary="a"),
+            _entity("Official", ["Organization", "Entity"], summary="b"),
+        ]
+        report = filter_entities_for_profiles(entities)
+        assert len(report.kept) == 2
+        assert report.merged == []
+
+    def test_empty_names_pass_through_without_collapsing(self, monkeypatch):
+        """空名称无身份意义：不参与合并分组、不互相折叠。质量过滤开启
+        时空名称会被先行剔除，这里关闭过滤以隔离去重行为。"""
+        monkeypatch.setenv("MIROFISH_ENTITY_QUALITY_FILTER", "0")
+        entities = [
+            _entity("", ["Person", "Entity"], summary=""),
+            _entity("", ["Person", "Entity"], summary=""),
+        ]
+        report = filter_entities_for_profiles(entities)
+        assert len(report.kept) == 2
+        assert report.merged == []
+
+    def test_dedupe_runs_even_when_quality_filter_is_disabled(self, monkeypatch):
+        """去重是正确性守卫：质量过滤开关不影响同一身份只保留一个发言人。"""
+        monkeypatch.setenv("MIROFISH_ENTITY_QUALITY_FILTER", "0")
+
+        entities = [
+            _entity("NeoLife", ["Organization", "Entity"], summary="a"),
+            _entity("NeoLife Official", ["Organization", "Entity"], summary="b"),
+        ]
+        report = filter_entities_for_profiles(entities)
+
+        assert len(report.kept) == 1
+        assert report.dropped == []
+        assert len(report.merged) == 1
+
+    def test_report_dict_includes_merged_block(self):
+        import json
+
+        entities = [
+            _entity("NeoLife", ["Organization", "Entity"], summary="a"),
+            _entity("NeoLife Official", ["Organization", "Entity"], summary="b"),
+        ]
+        report = filter_entities_for_profiles(entities)
+        payload = report.to_dict()
+
+        assert payload["kept_count"] == 1
+        assert payload["merged_count"] == 1
+        assert payload["total_input"] == 2
+        assert payload["merged"][0]["entity_name"] == "NeoLife Official"
+        assert payload["merged"][0]["action"] == "merge"
+        assert payload["merged"][0]["kept_name"] == "NeoLife"
+        # 审计块必须可序列化（写入entity_quality_report.json）
+        json.dumps(payload, ensure_ascii=False)
+
+    def test_dedupe_drops_no_entities_when_all_identities_unique(self):
+        entities = [
+            _entity("NeoLife", ["Organization", "Entity"], summary="a"),
+            _entity("NVIDIA Corporation", ["Organization", "Entity"], summary="b"),
+            _entity("Marcus R.", ["Person", "Entity"], summary="c"),
+        ]
+        report = filter_entities_for_profiles(entities)
+        assert [e.name for e in report.kept] == [
+            "NeoLife",
+            "NVIDIA Corporation",
+            "Marcus R.",
+        ]
+        assert report.merged == []

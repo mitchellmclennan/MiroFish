@@ -3,6 +3,8 @@
 The route must fail clearly (400 + entity_quality report) when the quality
 filter drops every entity — never a silent `success: true, count: 0` — and
 must report the post-filter entity types that actually produced profiles.
+The route also applies the prepare-level duplicate-speaker guard and must
+surface its merge audit (entity_quality.merged) in the response.
 """
 
 import pytest
@@ -135,3 +137,47 @@ def test_generate_profiles_still_fails_on_zero_pre_filter_entities(client, monke
     assert response.status_code == 400
     body = response.get_json()
     assert body["success"] is False
+
+
+def test_generate_profiles_dedupes_duplicate_speakers_and_audits_merges(
+    client, monkeypatch
+):
+    """重复发言主体守卫（prepare级）：同一归一化身份（"NeoLife"与
+    "NeoLife Official"）只生成一个人设，合并在entity_quality.merged审计。"""
+    StubGenerator = _stub_generator()
+    monkeypatch.setattr(
+        simulation_api_module,
+        "ZepEntityReader",
+        _stub_reader(
+            [
+                _entity(
+                    "NeoLife",
+                    ["Organization", "Entity"],
+                    "Fulfillment infrastructure.",
+                ),
+                _entity(
+                    "NeoLife Official",
+                    ["Organization", "Entity"],
+                    "Official account.",
+                ),
+            ]
+        ),
+    )
+    monkeypatch.setattr(simulation_api_module, "OasisProfileGenerator", StubGenerator)
+
+    response = client.post(
+        "/api/simulation/generate-profiles", json={"graph_id": "g"}
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()["data"]
+    # 同一身份只保留一个发言人：只有一个人设
+    assert data["count"] == 1
+    quality = data["entity_quality"]
+    assert quality["kept_count"] == 1
+    assert quality["merged_count"] == 1
+    merged = quality["merged"][0]
+    assert merged["entity_name"] == "NeoLife Official"
+    assert merged["kept_name"] == "NeoLife"
+    assert merged["action"] == "merge"
+    assert merged["reason"] == "duplicate_speaker_identity"

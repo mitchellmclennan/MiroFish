@@ -259,7 +259,10 @@ class SimulationManager:
         1. 从Zep图谱读取并过滤实体
         1.5 实体质量过滤（人设生成前清洗垃圾实体：法规、错标产品/公司、
             定价套餐档位、样板碎片等；剔除/重标详情写入entity_quality_report.json，
-            全部剔除时任务进入FAILED）
+            全部剔除时任务进入FAILED）+ 重复发言主体去重（同一归一化身份
+            ——大小写/空白折叠，外加封闭的"official"账号指代后缀——只保留
+            一个发言主体，防止同一现实实体生成多个Agent；合并详情同样
+            写入entity_quality_report.json的merged块）
         2. 为每个实体生成OASIS Agent Profile（可选LLM增强，支持并行）
         3. 使用LLM智能生成模拟配置参数（时间、活跃度、发言频率等）
         4. 保存配置文件和Profile文件

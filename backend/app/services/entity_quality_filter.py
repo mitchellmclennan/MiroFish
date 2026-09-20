@@ -20,11 +20,29 @@
 5. 空名称实体
 6. 低信息实体（无摘要、无属性、无任何关联边——没有任何可依据
    的事实来构建人设）
+7. 重复发言主体：同一"归一化身份"只保留一个发言主体。图谱提取常
+   把同一实体抽出多份（如 "NeoLife" 与 "NeoLife Official"、"neolife"
+   与 "NeoLife"），每份都会生成一个Agent人设，导致同一现实主体在
+   模拟中出现多个发言人。合并规则刻意保守、确定、可审计：
+   - 身份归一化只做大小写折叠与空白折叠（"NeoLife"≡"neolife"）；
+     标点差异（"Neo-Life"）不合并——身份合并不得把不同的品牌拼写
+     混为一谈（不合并无关别名）；
+   - 另外剥离一组封闭的"账号指代"后缀词（"official" / "official
+     account" / "official page"，须为独立结尾词，如 "NeoLife
+     Official"→"neolife"），"NeoLife" 与 "NeoLife Official" 视为同一
+     主体；该列表刻意不包含 team/labs/group 等可能属于独立实体名的词；
+   - 同组保留信息量最大的实体（关联边数 > 关联节点数 > 摘要长度 >
+     属性数，平局取输入序最前者），其余记入报告的 merged 列表；
+   - 去重属于正确性守卫（同一主体不得生成多个发言人），因此
+     MIROFISH_ENTITY_QUALITY_FILTER=0 关闭质量过滤时仍然执行；
+     每次合并都记录在entity_quality报告（entity_quality_report.json
+     及 /generate-profiles 响应的 merged 块）中供人工审计。
 
 规则刻意保持保守、可解释、可审计：所有删除都附带原因并记录在
 质量报告中，方便人工复核。
 
-通过环境变量 MIROFISH_ENTITY_QUALITY_FILTER=0 可整体关闭。
+通过环境变量 MIROFISH_ENTITY_QUALITY_FILTER=0 可整体关闭质量过滤
+（重复发言主体去重除外，见上）。
 """
 
 import os
@@ -271,21 +289,52 @@ class EntityQualityDecision:
 
 
 @dataclass
+class EntityMergeDecision:
+    """单条重复发言主体的合并决策
+
+    同一归一化身份的额外实体不再单独生成人设，合并进保留的代表
+    实体；决策写入报告供人工审计。
+    """
+    entity_name: str
+    entity_type: Optional[str]
+    identity: str  # 判定同一身份所用的归一化键
+    kept_name: str  # 保留为代表发言主体的实体名称
+    reason: str = "duplicate_speaker_identity"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "entity_name": self.entity_name,
+            "entity_type": self.entity_type,
+            "action": "merge",
+            "identity": self.identity,
+            "kept_name": self.kept_name,
+            "reason": self.reason,
+        }
+
+
+@dataclass
 class EntityQualityReport:
     """实体质量过滤结果（含审计信息）"""
     kept: List[EntityNode] = field(default_factory=list)
     dropped: List[EntityQualityDecision] = field(default_factory=list)
     relabeled: List[EntityQualityDecision] = field(default_factory=list)
+    merged: List[EntityMergeDecision] = field(default_factory=list)
 
     @property
     def total_input(self) -> int:
-        return len(self.kept) + len(self.dropped) + len(self.relabeled)
+        return (
+            len(self.kept)
+            + len(self.dropped)
+            + len(self.relabeled)
+            + len(self.merged)
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "kept_count": len(self.kept),
             "dropped_count": len(self.dropped),
             "relabeled_count": len(self.relabeled),
+            "merged_count": len(self.merged),
             "total_input": self.total_input,
             "kept": [
                 {"name": e.name, "type": e.get_entity_type()}
@@ -293,6 +342,7 @@ class EntityQualityReport:
             ],
             "dropped": [d.to_dict() for d in self.dropped],
             "relabeled": [d.to_dict() for d in self.relabeled],
+            "merged": [m.to_dict() for m in self.merged],
         }
 
 
@@ -457,16 +507,135 @@ def is_entity_quality_filter_enabled() -> bool:
     return value not in {"0", "false", "off", "no"}
 
 
+# ── 重复发言主体去重（prepare级别守卫） ───────────────────────────────────────
+# 账号指代后缀词：结尾的独立词（须与前面有空白分隔），不改变主体身份
+# （"NeoLife"与"NeoLife Official"是同一组织的官方账号）。刻意保持
+# 封闭小集合：team/labs/group等词可能属于独立实体名，不得剥离，避免
+# 把无关别名合并。顺序按长度降序，先匹配最长的后缀。
+_GENERIC_ACCOUNT_SUFFIX_WORDS: tuple = (
+    "official account",
+    "official page",
+    "official",
+)
+
+
+def normalize_speaker_identity(name: str) -> str:
+    """归一化实体名称为发言身份键。
+
+    刻意保守：只做空白折叠与大小写折叠（"NeoLife"≡"neolife"）。
+    标点差异不折叠（"Neo-Life"≠"NeoLife"）——身份合并不得把不同的
+    品牌拼写混为一谈。
+    """
+
+    return " ".join((name or "").split()).lower()
+
+
+def strip_generic_account_suffix(identity: str) -> str:
+    """剥离结尾的账号指代后缀词（独立词，如" neolife official"→"neolife"）。
+
+    仅当剥离后仍非空时才剥离（"Official"这类纯后缀名称保持原样，
+    只与完全同名的实体合并）；"BarOfficial"这类粘连词不是独立
+    结尾词，不剥离。
+    """
+
+    stripped = identity.strip()
+    for suffix in _GENERIC_ACCOUNT_SUFFIX_WORDS:
+        if stripped != suffix and stripped.endswith(" " + suffix):
+            remainder = stripped[: -len(" " + suffix)].strip()
+            if remainder:
+                return remainder
+    return stripped
+
+
+def _speaker_information_rank(entity: EntityNode, input_index: int):
+    """发言主体的信息量排序键：保留信息量最大的实体，平局取输入序最前。
+
+    排序依据（按重要性降序）：关联边数 > 关联节点数 > 摘要长度 >
+    属性数。完全确定：同一输入永远得到同一保留者。
+    """
+
+    return (
+        len(entity.related_edges or []),
+        len(entity.related_nodes or []),
+        len((entity.summary or "").strip()),
+        len(entity.attributes or {}),
+        -input_index,
+    )
+
+
+def dedupe_duplicate_speakers(report: EntityQualityReport) -> EntityQualityReport:
+    """同一归一化身份只保留一个发言主体（在报告的kept上原地折叠）。
+
+    图谱提取常把同一现实主体抽出多份（"NeoLife" + "NeoLife
+    Official"、"neolife" + "NeoLife"），每份都会生成一个Agent人设，
+    造成同一主体在模拟中多次发言。合并规则：
+
+    - 身份键 = strip_generic_account_suffix(normalize_speaker_identity(
+      name))：大小写/空白折叠，外加封闭列表的账号指代后缀剥离；
+    - 空名称实体不参与合并（空键无身份意义），原样通过；
+    - 同组保留 _speaker_information_rank 最大的实体；
+    - 其余成员记入 report.merged（含保留者名称），保留列表维持
+      输入顺序。
+
+    这是正确性守卫而非质量启发式，因此在质量过滤被环境变量关闭时
+    仍然执行（调用方 filter_entities_for_profiles 保证）。
+    """
+
+    groups: Dict[str, List[Any]] = {}
+    for index, entity in enumerate(report.kept):
+        identity = normalize_speaker_identity(entity.name or "")
+        if not identity:
+            # 空名称无法归一化：不参与合并分组，原样保留
+            continue
+        key = strip_generic_account_suffix(identity)
+        groups.setdefault(key, []).append((index, entity))
+
+    merged_ids: Set[int] = set()
+    for key, members in groups.items():
+        if len(members) == 1:
+            continue
+        best_index, best = max(
+            members, key=lambda pair: _speaker_information_rank(pair[1], pair[0])
+        )
+        for index, entity in members:
+            if index == best_index:
+                continue
+            merged_ids.add(id(entity))
+            report.merged.append(
+                EntityMergeDecision(
+                    entity_name=entity.name,
+                    entity_type=entity.get_entity_type(),
+                    identity=key,
+                    kept_name=best.name,
+                )
+            )
+
+    if merged_ids:
+        # 保持输入顺序：被合并的重复实体从保留列表中移除（空名称等
+        # 无法归一化的实体不参与分组，自然保留）
+        report.kept = [
+            entity for entity in report.kept if id(entity) not in merged_ids
+        ]
+        logger.info(
+            f"重复发言主体去重完成: 合并 {len(report.merged)} 个重复实体 "
+            f"({', '.join(m.kept_name + ' <- ' + m.entity_name for m in report.merged)})"
+        )
+    return report
+
+
 def filter_entities_for_profiles(
     entities: List[EntityNode],
 ) -> EntityQualityReport:
     """
-    在人设生成前应用质量过滤（考虑开关）。
+    在人设生成前应用质量过滤（考虑开关）与重复发言主体去重。
 
-    关闭时返回原列表并生成空报告（不修改任何实体）。
+    关闭质量过滤时返回原列表并生成空报告（不修改任何实体），但
+    重复发言主体去重仍然执行——同一归一化身份生成多个发言人属于
+    正确性问题，不是质量启发式。
     """
     if not is_entity_quality_filter_enabled():
         report = EntityQualityReport(kept=list(entities))
         logger.info("实体质量过滤已通过环境变量关闭，跳过过滤")
-        return report
-    return EntityQualityFilter().filter_entities(entities)
+    else:
+        report = EntityQualityFilter().filter_entities(entities)
+    return dedupe_duplicate_speakers(report)
