@@ -69,7 +69,17 @@ class Config:
         if not cls.ZEP_API_KEY:
             errors.append("ZEP_API_KEY 未配置")
         if os.environ.get("ZEP_API_URL"):
-            errors.append("ZEP_API_URL 不受支持；MiroFish 仅连接 Zep Cloud")
+            errors.append(
+                "ZEP_API_URL 不受支持（zep-cloud SDK 会静默优先使用它）；"
+                "请改用 ZEP_BASE_URL 配置 Zep 端点"
+            )
+        from .utils.zep import get_zep_base_url, get_zep_mode
+
+        try:
+            get_zep_mode()
+            get_zep_base_url()
+        except ValueError as error:
+            errors.append(str(error))
         if cls.DEBUG:
             import warnings
             warnings.warn("Flask DEBUG mode is enabled. Do not use in production.", RuntimeWarning)
