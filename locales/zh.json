@@ -354,6 +354,7 @@
     "scriptFileNotFound": "脚本文件不存在: {name}",
     "requireGraphId": "请提供 graph_id",
     "noMatchingEntities": "没有找到符合条件的实体",
+    "qualityFilterDroppedAllEntities": "实体质量过滤后没有可用实体（全部被判定为垃圾实体），详见返回数据中的 entity_quality 报告",
     "maxRoundsPositive": "max_rounds 必须是正整数",
     "maxRoundsInvalid": "max_rounds 必须是有效的整数",
     "invalidPlatform": "无效的平台类型: {platform}，可选: twitter/reddit/parallel",

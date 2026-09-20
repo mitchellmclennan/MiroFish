@@ -403,9 +403,12 @@ def prepare_simulation():
     步骤：
     1. 检查是否已有完成的准备工作
     2. 从Zep图谱读取并过滤实体
-    3. 为每个实体生成OASIS Agent Profile（带重试机制）
-    4. LLM智能生成模拟配置（带重试机制）
-    5. 保存配置文件和预设脚本
+    3. 实体质量过滤（生成人设前清洗垃圾实体：法规、错标产品/公司、
+       定价套餐档位、样板碎片等；剔除/重标详情写入模拟目录的
+       entity_quality_report.json，全部剔除时任务失败）
+    4. 为每个实体生成OASIS Agent Profile（带重试机制）
+    5. LLM智能生成模拟配置（带重试机制）
+    6. 保存配置文件和预设脚本
     
     请求（JSON）：
         {
@@ -1429,7 +1432,7 @@ def download_simulation_script(script_name: str):
 def generate_profiles():
     """
     直接从图谱生成OASIS Agent Profile（不创建模拟）
-    
+
     请求（JSON）：
         {
             "graph_id": "mirofish_xxxx",     // 必填
@@ -1437,6 +1440,13 @@ def generate_profiles():
             "use_llm": true,                  // 可选
             "platform": "reddit"              // 可选
         }
+
+    说明：
+        - 人设生成前会应用实体质量过滤（可用MIROFISH_ENTITY_QUALITY_FILTER=0关闭）；
+          过滤剔除全部实体时返回400（success:false）并附entity_quality报告，
+          不会静默返回空人设列表；
+        - 返回的entity_types是过滤后实际生成人设的实体类型；被剔除实体的
+          类型和原因见entity_quality块。
     """
     try:
         data = request.get_json() or {}
@@ -1467,25 +1477,52 @@ def generate_profiles():
         
         # 人设生成前过滤垃圾实体（法规、错标产品/公司、样板碎片等）
         quality_report = filter_entities_for_profiles(filtered.entities)
-        
+
+        # 质量过滤剔除全部实体时必须显式失败（与prepare_simulation的
+        # 行为一致），不能以 success:true + count:0 静默继续；返回
+        # entity_quality 报告便于人工审计哪些实体被剔除及原因
+        if not quality_report.kept:
+            logger.warning(
+                f"图谱 {graph_id} 的 {filtered.filtered_count} 个实体全部被质量过滤剔除"
+            )
+            return jsonify({
+                "success": False,
+                "error": t('api.qualityFilterDroppedAllEntities'),
+                "data": {
+                    "entity_quality": {
+                        "kept_count": 0,
+                        "dropped_count": len(quality_report.dropped),
+                        "relabeled_count": len(quality_report.relabeled),
+                        "dropped": [d.to_dict() for d in quality_report.dropped],
+                        "relabeled": [d.to_dict() for d in quality_report.relabeled],
+                    }
+                }
+            }), 400
+
         generator = OasisProfileGenerator()
         profiles = generator.generate_profiles_from_entities(
             entities=quality_report.kept,
             use_llm=use_llm
         )
-        
+
         if platform == "reddit":
             profiles_data = [p.to_reddit_format() for p in profiles]
         elif platform == "twitter":
             profiles_data = [p.to_twitter_format() for p in profiles]
         else:
             profiles_data = [p.to_dict() for p in profiles]
-        
+
+        # entity_types 必须反映过滤后实际用于生成人设的实体类型
+        # （pre-filter集合包含被剔除实体的类型，会误导调用方）
+        kept_entity_types = sorted({
+            e.get_entity_type() or "Unknown" for e in quality_report.kept
+        })
+
         return jsonify({
             "success": True,
             "data": {
                 "platform": platform,
-                "entity_types": list(filtered.entity_types),
+                "entity_types": kept_entity_types,
                 "count": len(profiles_data),
                 "profiles": profiles_data,
                 "entity_quality": {

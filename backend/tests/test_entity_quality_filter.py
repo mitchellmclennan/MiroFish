@@ -213,18 +213,189 @@ class TestLowInformationFiltering:
         assert report.kept
 
 
+class TestRealEntityPreservation:
+    """评审H2回归：真实组织/人物不得被名称形状规则误删。"""
+
+    def test_usc_organization_is_kept(self):
+        """\bu.?s.?c\b曾把南加州大学缩写当法规引证删除；无点号缩写不再是引证。"""
+        entity = _entity("USC", ["Organization", "Entity"], summary="The university.")
+        report = EntityQualityFilter().filter_entities([entity])
+        assert report.kept and report.kept[0].name == "USC"
+
+    def test_dotted_statute_citations_are_still_dropped(self):
+        """带点号的U.S.C./C.F.R.引证仍然必须删除。"""
+        for name in ("U.S.C.", "C.F.R.", "21 U.S.C. § 1798"):
+            entity = _entity(name, ["ExtractedEntity", "Entity"], summary="legal")
+            report = EntityQualityFilter().filter_entities([entity])
+            assert report.dropped and report.dropped[0].reason == "statute", name
+
+    def test_short_and_number_led_org_names_are_kept(self):
+        """3M/7-Eleven是真实机构名；过短/数字开头规则豁免组织标签。"""
+        for name in ("3M", "7-Eleven"):
+            entity = _entity(name, ["Organization", "Entity"], summary="A real company.")
+            report = EntityQualityFilter().filter_entities([entity])
+            assert report.kept and report.kept[0].name == name, name
+
+    def test_number_led_generic_fragments_are_still_dropped(self):
+        entity = _entity("300 orders/mo", ["ExtractedEntity", "Entity"], summary="")
+        report = EntityQualityFilter().filter_entities([entity])
+        assert report.dropped[0].reason == "number_led_fragment"
+
+    def test_lowercase_person_with_generic_label_is_kept(self):
+        """评审H2：marcus r.被提取器打上默认ExtractedEntity标签，不得因小写被删。"""
+        entity = _entity(
+            "marcus r.",
+            ["ExtractedEntity", "Entity"],
+            summary="An order was drafted for marcus r.",
+        )
+        report = EntityQualityFilter().filter_entities([entity])
+        assert report.kept and report.kept[0].name == "marcus r."
+
+    def test_lowercase_person_shapes_with_multiple_initials_are_kept(self):
+        entity = _entity(
+            "dana r. j.",
+            ["ExtractedEntity", "Entity"],
+            summary="A coordinator.",
+        )
+        report = EntityQualityFilter().filter_entities([entity])
+        assert report.kept and report.kept[0].name == "dana r. j."
+
+    def test_lowercase_concept_fragments_are_still_dropped(self):
+        """人名形状豁免不得放开概念碎片：无缩写的小写片段仍应被删。"""
+        names = ["provider approval", "roll-up billing", "carrier", "olife"]
+        entities = [_entity(n, ["ExtractedEntity", "Entity"], summary="") for n in names]
+        report = EntityQualityFilter().filter_entities(entities)
+        assert {d.entity_name for d in report.dropped} == set(names)
+        assert all(d.reason == "generic_lowercase_fragment" for d in report.dropped)
+
+
+class TestPricingTierFiltering:
+    """评审H2回归：定价套餐档位不得成为社媒发言主体。"""
+
+    def test_bare_tier_names_are_dropped_for_generic_labels(self):
+        entities = [
+            _entity(n, ["ExtractedEntity", "Entity"], summary="A plan tier.")
+            for n in ("Starter", "Growth", "Scale")
+        ]
+        report = EntityQualityFilter().filter_entities(entities)
+        assert len(report.dropped) == 3
+        assert all(d.reason == "pricing_tier_not_a_speaker" for d in report.dropped)
+
+    def test_tier_pricing_summaries_are_dropped(self):
+        """真实trial图谱形态："Growth plan costs $1,999/month plus $3.50 per order."。"""
+        entity = _entity(
+            "Growth",
+            ["ExtractedEntity", "Entity"],
+            summary="Growth plan costs $1,999/month plus $3.50 per order.",
+        )
+        report = EntityQualityFilter().filter_entities([entity])
+        assert report.kept == []
+        assert report.dropped[0].reason == "pricing_tier_not_a_speaker"
+
+    def test_price_signature_names_are_dropped(self):
+        for name in ("Instant + $3.00 / order", "Priority + $1.50 / order"):
+            entity = _entity(name, ["ExtractedEntity", "Entity"], summary="")
+            report = EntityQualityFilter().filter_entities([entity])
+            assert report.dropped and report.dropped[0].reason == "pricing_tier_not_a_speaker", name
+
+    def test_tier_word_fragments_are_dropped(self):
+        for name in ("Starter Intake to pharmacy", "Standard Included Approved orders"):
+            entity = _entity(name, ["ExtractedEntity", "Entity"], summary="")
+            report = EntityQualityFilter().filter_entities([entity])
+            assert report.dropped and report.dropped[0].reason == "pricing_tier_not_a_speaker", name
+
+    def test_person_summary_mentioning_pricing_is_not_dropped(self):
+        """反误伤：人物摘要提到自己付了套餐价，不是定价档位。"""
+        entity = _entity(
+            "Marcus R.",
+            ["Person", "Entity"],
+            summary="Marcus R. pays for the Starter plan at $699/mo.",
+        )
+        report = EntityQualityFilter().filter_entities([entity])
+        assert report.kept and report.kept[0].name == "Marcus R."
+
+    def test_person_summary_with_verb_plans_is_not_dropped(self):
+        """反误伤："Marcus plans to attend…"里的plans是动词，不是套餐描述。"""
+        entity = _entity(
+            "Marcus",
+            ["Person", "Entity"],
+            summary="Marcus plans monthly payments of $699 with his accountant.",
+        )
+        report = EntityQualityFilter().filter_entities([entity])
+        assert report.kept and report.kept[0].name == "Marcus"
+
+    def test_tier_word_prefixed_non_pricing_names_are_kept(self):
+        """反误伤："Growth team"不含套餐/计费特征词，不得按档位删除。"""
+        entity = _entity("Growth team", ["ExtractedEntity", "Entity"], summary="A team.")
+        report = EntityQualityFilter().filter_entities([entity])
+        assert report.kept and report.kept[0].name == "Growth team"
+
+    def test_organization_labeled_tier_word_is_kept(self):
+        """组织标签豁免：仅凭名称无法区分"Enterprise"是真机构还是套餐档位。"""
+        entity = _entity(
+            "Enterprise",
+            ["Organization", "Entity"],
+            summary="Enterprise offers a control plane for managing multiple clinics.",
+        )
+        report = EntityQualityFilter().filter_entities([entity])
+        assert report.kept and report.kept[0].name == "Enterprise"
+
+
+class TestDrugPseudoEntityFiltering:
+    """评审H2回归：药物/激素类伪实体不得成为发言主体（大小写无关）。"""
+
+    def test_drug_names_are_dropped_for_generic_labels(self):
+        names = [
+            "Testosterone",
+            "Peptides",
+            "Testosterone Cypionate",
+            "progesterone",  # 评审：小写同类被删而大写逃逸——现在大小写都删
+            "estradiol",
+            "Hormone therapy HRT",
+            "Hormone therapy HRT: estradiol, progesterone",
+            "TRT Men's hormones",
+            "Tretinoin and derm compounds",
+            "Low-dose naltrexone LDN protocols",
+        ]
+        entities = [_entity(n, ["ExtractedEntity", "Entity"], summary="") for n in names]
+        report = EntityQualityFilter().filter_entities(entities)
+        dropped = {d.entity_name for d in report.dropped}
+        for name in names:
+            assert name in dropped, name
+            assert all(
+                d.reason in ("product_not_a_speaker", "generic_lowercase_fragment")
+                for d in report.dropped
+                if d.entity_name == name
+            )
+
+    def test_drug_mislabeled_as_person_is_dropped(self):
+        entity = _entity("Testosterone", ["Person", "Entity"], summary="A hormone.")
+        report = EntityQualityFilter().filter_entities([entity])
+        assert report.dropped[0].reason == "product_mislabeled_as_person"
+
+    def test_organization_with_drug_words_is_kept(self):
+        entity = _entity("Hormone Health Clinic", ["Clinic", "Entity"], summary="A clinic.")
+        report = EntityQualityFilter().filter_entities([entity])
+        assert report.kept and report.kept[0].name == "Hormone Health Clinic"
+
+
 class TestFilterIntegrationContract:
     def test_neolife_style_corpus_is_filtered_correctly(self):
         """以真实NeoLife图谱中的实体形态做回归验证。"""
         entities = [
             _entity("neolife", ["Organization", "Entity"], summary="neolife is the fulfillment infrastructure."),
             _entity("NVIDIA Corporation", ["Organization", "Entity"], summary="NVIDIA Corporation owns trademarks."),
+            _entity("7-Eleven", ["Organization", "Entity"], summary="A convenience store chain."),
             _entity("Marcus R.", ["Person", "Entity"], summary="An order was drafted for Marcus R."),
+            _entity("marcus r.", ["ExtractedEntity", "Entity"], summary="An order was drafted for marcus r."),
             _entity("Dana R.", ["Person", "Entity"], summary="A coordinator processes orders."),
             _entity("Dr.", ["Person", "Entity"], summary="Dr. approved orders using a streamlined interface."),
             _entity("Anti-Kickback Statute", ["ExtractedEntity", "Entity"], summary="A fee structure remains constant."),
             _entity("EKRA", ["ExtractedEntity", "Entity"], summary="Fees under EKRA are regulated."),
             _entity("tretinoin 0.05% cream", ["ExtractedEntity", "Entity"], summary="A refill order is being processed."),
+            _entity("Testosterone", ["ExtractedEntity", "Entity"], summary="A hormone used in therapy."),
+            _entity("Growth", ["ExtractedEntity", "Entity"], summary="Growth plan costs $1,999/month plus $3.50 per order."),
+            _entity("Instant + $3.00 / order", ["ExtractedEntity", "Entity"], summary=""),
             _entity("Sexual health Troches", ["ExtractedEntity", "Entity"], summary=""),
             _entity("intake_2026-06-30.pdf", ["ExtractedEntity", "Entity"], summary="The document contains 3 pages."),
             _entity("300 orders/mo", ["ExtractedEntity", "Entity"], summary="Clinics must upgrade when they clear 300 orders."),
@@ -238,7 +409,9 @@ class TestFilterIntegrationContract:
         kept_names = {e.name for e in report.kept}
         assert "neolife" in kept_names
         assert "NVIDIA Corporation" in kept_names
+        assert "7-Eleven" in kept_names
         assert "Marcus R." in kept_names
+        assert "marcus r." in kept_names
         assert "Dana R." in kept_names
         assert "Crunchbase" in kept_names
         assert "partner negotiators" in kept_names
@@ -248,6 +421,9 @@ class TestFilterIntegrationContract:
         assert "Anti-Kickback Statute" in dropped_names
         assert "EKRA" in dropped_names
         assert "tretinoin 0.05% cream" in dropped_names
+        assert "Testosterone" in dropped_names
+        assert "Growth" in dropped_names
+        assert "Instant + $3.00 / order" in dropped_names
         assert "Sexual health Troches" in dropped_names
         assert "intake_2026-06-30.pdf" in dropped_names
         assert "300 orders/mo" in dropped_names

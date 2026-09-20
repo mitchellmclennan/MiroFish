@@ -4,13 +4,21 @@
 针对OpenZep本地图谱提取中常见的垃圾实体，在生成Agent Profile前做
 确定性（规则式）清洗，避免以下实体被误当成社媒发言主体：
 
-1. 法规/法律文件（statutes、regulations、named acts）
+1. 法规/法律文件（statutes、regulations、named acts）。缩写类引证
+   （U.S.C.、C.F.R.）必须带点号才匹配——USC（南加州大学）这类无点号
+   组织缩写不受影响。
 2. 被错标成"人物"的产品或公司——产品直接丢弃；公司重新标注为
-   Organization保留（合法公司仍是合法发言主体）
-3. 样板/文档碎片（文件名、URL、称谓、占位符、数字开头的片段、
-   小写开头的未分类通用实体）
-4. 空名称实体
-5. 低信息实体（无摘要、无属性、无任何关联边——没有任何可依据
+   Organization保留（合法公司仍是合法发言主体）。药物/激素类分子名
+   （testosterone、peptides、HRT等）按产品处理：分子不是发言主体。
+3. 定价/套餐档位（Starter、Growth、含价格签名的"Instant + $3.00 /
+   order"等）——套餐档位不是发言主体。组织标签豁免：仅凭名称无法
+   与真实机构区分时不删（如 "Enterprise"）。
+4. 样板/文档碎片（文件名、URL、称谓、占位符）。过短/数字开头的名称
+   规则对明确标注的组织标签豁免（3M、7-Eleven是真实机构名）。
+   小写未分类碎片规则对人名形状（"marcus r."＝单词+姓名缩写）豁免：
+   真实人物可能被提取器打上默认标签并保留小写名称。
+5. 空名称实体
+6. 低信息实体（无摘要、无属性、无任何关联边——没有任何可依据
    的事实来构建人设）
 
 规则刻意保持保守、可解释、可审计：所有删除都附带原因并记录在
@@ -58,13 +66,15 @@ GENERIC_LABELS: Set[str] = {"entity", "node", "extractedentity", ""}
 
 # 法规名称特征（作用于实体名称，避免误伤仅在摘要中讨论法规的主体）。
 # "X Act"/"X Law" 用双词组匹配，避免误伤以Act开头的公司名。
+# 缩写类引证（U.S.C.、C.F.R.）必须带点号匹配：像 USC（南加州大学）或
+# CFR 这样的无点号组织缩写不得被当成法规引证删除（评审H2假阳性）。
 _STATUTE_NAME_PATTERNS = [
     re.compile(r"\bstatute\b", re.IGNORECASE),
     re.compile(r"\banti[- ]?kickback\b", re.IGNORECASE),
     re.compile(r"\bpublic law\b", re.IGNORECASE),
     re.compile(r"\bcode of federal regulations\b", re.IGNORECASE),
     re.compile(r"\bc\.f\.r\b", re.IGNORECASE),
-    re.compile(r"\bu\.?s\.?c\b", re.IGNORECASE),
+    re.compile(r"\bu\.s\.c\b", re.IGNORECASE),
     re.compile(r"\bhipaa\b", re.IGNORECASE),
     re.compile(r"\bekra\b", re.IGNORECASE),
     re.compile(r"\baks\b", re.IGNORECASE),
@@ -93,6 +103,43 @@ _PRODUCT_NAME_PATTERNS = [
     re.compile(r"\bodt\b", re.IGNORECASE),
 ]
 
+# 药物/分子/激素类名称——分子本身不是社媒发言主体。评审H2假阴性：
+# "Testosterone"/"Peptides"/"progesterone"等曾因大写首字母逃过小写碎片
+# 规则而被当成发言主体生成了人设。
+_DRUG_NAME_PATTERNS = [
+    re.compile(
+        r"\b(?:testosterone|estradiol|estrogen|progesterone|peptides?|"
+        r"hormones?|naltrexone|tretinoin|finasteride|minoxidil|"
+        r"semaglutide|tirzepatide|metformin|oxytocin)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:trt|hrt|glp[- ]?1)\b", re.IGNORECASE),
+]
+
+# 定价/套餐档位词汇。作为完整名称或名称首词出现时（且非组织标签），
+# 该实体是套餐档位而不是发言主体（NeoLife语料的 Starter/Growth/Scale）。
+_PRICING_TIER_NAME_WORDS: Set[str] = {
+    "starter", "growth", "scale", "basic", "premium", "standard",
+    "professional", "enterprise", "essential", "advanced",
+}
+
+# 套餐/计费特征词——多词名称以档位词开头且含这些词时判为套餐片段
+# （如 "Starter Intake to pharmacy"、"Standard Included Approved orders"）。
+_PLAN_FEATURE_PATTERN = re.compile(
+    r"\b(?:plan|plans|intake|order|orders|included|approved|approvals|"
+    r"billing|fee|fees|monthly|annual|per-order)\b",
+    re.IGNORECASE,
+)
+
+# 名称中的价格签名（如 "Instant + $3.00 / order"）。
+_PRICING_SIGNATURE_PATTERN = re.compile(r"\$\s*\d")
+
+# 摘要中的通用套餐描述（"is a pricing/subscription/membership plan|tier"）。
+_PRICING_SUMMARY_PATTERN = re.compile(
+    r"\bis an? (?:pricing|subscription|membership) (?:plan|tier)\b",
+    re.IGNORECASE,
+)
+
 # 产品摘要特征（仅对错标为人物的实体使用）。
 _PRODUCT_SUMMARY_PATTERN = re.compile(
     r"\bis an? (?:product|supplement|medication|drug|beverage|shake|kit|"
@@ -118,6 +165,12 @@ _HONORIFIC_NAMES = {
     "sir", "madam", "officer", "manager", "ceo", "founder", "owner",
     "coordinator", "nurse", "pharmacist", "provider",
 }
+
+# 小写人名形状：单词 + 一个或多个姓名首字母缩写（"marcus r."、"dana r"）。
+# 提取器常给真实人物打上默认的 ExtractedEntity 标签并保留小写名称，
+# 这类实体不得被小写碎片规则误删（评审H2假阳性）；无缩写的小写单词
+# （"carrier"、"olife"）仍是碎片。
+_LOWERCASE_PERSON_NAME_PATTERN = re.compile(r"^[a-z]+(?:\s+[a-z]\.?)+\s*$")
 
 # 文件名特征。
 _FILENAME_PATTERN = re.compile(
@@ -150,7 +203,45 @@ def _is_company_name(name: str) -> bool:
 
 
 def _is_product_name(name: str) -> bool:
-    return any(pattern.search(name) for pattern in _PRODUCT_NAME_PATTERNS)
+    if any(pattern.search(name) for pattern in _PRODUCT_NAME_PATTERNS):
+        return True
+    return any(pattern.search(name) for pattern in _DRUG_NAME_PATTERNS)
+
+
+def _is_pricing_tier(name: str, summary: str) -> bool:
+    """
+    名称/摘要形似定价套餐档位（Starter/Growth/…或含价格签名）。
+
+    判定依据（全部只作用于非组织类标签，组织豁免与产品规则一致）：
+    1. 名称整体就是档位词（"Starter"、"Growth"）；
+    2. 名称以档位词开头且包含套餐/计费特征词（"Starter Intake to
+       pharmacy"）；
+    3. 名称中直接出现价格（"Instant + $3.00 / order"）；
+    4. 摘要以"<名称> plan(s) <定价动词>…<价格签名>"描述该实体
+       （"Growth plan costs $1,999/month plus $3.50 per order."）；
+    5. 摘要称其为定价/订阅/会员套餐（"is a pricing plan/tier"）。
+    """
+    lowered = name.strip().lower()
+    if lowered in _PRICING_TIER_NAME_WORDS:
+        return True
+    first_word = lowered.split(" ", 1)[0]
+    if first_word in _PRICING_TIER_NAME_WORDS and _PLAN_FEATURE_PATTERN.search(lowered):
+        return True
+    if _PRICING_SIGNATURE_PATTERN.search(name):
+        return True
+    if summary:
+        name_prefix = re.escape(name.strip())
+        plan_summary = re.compile(
+            rf"\s*{name_prefix}\s+plans?\s+"
+            rf"(?:costs?|starts?\s+at|includes?|provides?|offers?|has|is)\b"
+            rf".*(?:\$\s*\d|\bper[_ ](?:order|month)\b|/\s*mo\b)",
+            re.IGNORECASE | re.DOTALL,
+        )
+        if plan_summary.search(summary):
+            return True
+        if _PRICING_SUMMARY_PATTERN.search(summary):
+            return True
+    return False
 
 
 def _has_meaningful_attributes(entity: EntityNode) -> bool:
@@ -278,10 +369,17 @@ class EntityQualityFilter:
                 self._drop(entity, "product_mislabeled_as_person", report)
                 return None
 
-        # 4. 非组织类实体的产品名（剂型/浓度等）——产品不是发言主体。
+        # 4. 非组织类实体的产品名（剂型/浓度/药物分子等）——产品不是发言主体。
         #    组织类标签优先豁免，避免误伤合法公司。
         if label not in ORGANIZATION_LABELS and _is_product_name(name):
             self._drop(entity, "product_not_a_speaker", report)
+            return None
+
+        # 4.5 定价/套餐档位（Starter/Growth/含价格签名的片段等）——套餐
+        #     档位不是发言主体。组织标签豁免（"Enterprise"这类组织名
+        #     可能是真实机构，仅凭名称无法区分时不删）。
+        if label not in ORGANIZATION_LABELS and _is_pricing_tier(name, entity.summary or ""):
+            self._drop(entity, "pricing_tier_not_a_speaker", report)
             return None
 
         # 5. 样板/文档碎片
@@ -301,15 +399,26 @@ class EntityQualityFilter:
         if not _has_alpha(name):
             self._drop(entity, "no_alphabetic_characters", report)
             return None
-        if len(re.findall(r"[^\W\d_]", name)) <= 1:
+        # 组织类标签豁免过短/数字开头规则：3M、7-Eleven 这类真实机构名
+        # 不是碎片（评审H2假阳性）；豁免只针对明确标注的组织标签。
+        if (
+            len(re.findall(r"[^\W\d_]", name)) <= 1
+            and label not in ORGANIZATION_LABELS
+        ):
             self._drop(entity, "name_too_short", report)
             return None
-        if name[0].isdigit():
+        if name[0].isdigit() and label not in ORGANIZATION_LABELS:
             self._drop(entity, "number_led_fragment", report)
             return None
 
-        # 6. 未分类通用实体的小写碎片（OpenZep默认提取的概念片段）
-        if label in GENERIC_LABELS and name[0].islower():
+        # 6. 未分类通用实体的小写碎片（OpenZep默认提取的概念片段）。
+        #    例外：形如 "marcus r."（单词+姓名缩写）的小写人名——真实人物
+        #    可能被提取器打上默认标签，不因大小写被误删（评审H2假阳性）。
+        if (
+            label in GENERIC_LABELS
+            and name[0].islower()
+            and not _LOWERCASE_PERSON_NAME_PATTERN.match(name)
+        ):
             self._drop(entity, "generic_lowercase_fragment", report)
             return None
 

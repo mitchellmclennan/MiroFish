@@ -4,6 +4,10 @@ import threading
 from typing import Optional
 from flask import request, has_request_context
 
+from .logger import get_logger
+
+logger = get_logger('mirofish.locale')
+
 _thread_local = threading.local()
 
 # Run-level LLM output language override. Set to a locale code (e.g. "en")
@@ -11,7 +15,20 @@ _thread_local = threading.local()
 # to emit the matching language directive, independent of request/thread
 # locale. Used for bounded runs that must stay in one language end to end
 # (ontology, personas, actions/posts episode text, reports).
+#
+# Only "en" is actually supported end to end: the English persona/config
+# templates exist solely as English variants, so forcing any other language
+# would produce mixed-language output. Region variants (en-US, en_US) are
+# normalized to "en"; other values are rejected with a warning and the run
+# falls back to locale-driven behavior.
 FORCED_LLM_LANGUAGE_ENV = "MIROFISH_LLM_LANGUAGE"
+
+# Only this primary language has full pipeline support for run-level forcing.
+SUPPORTED_FORCED_LLM_LANGUAGE = "en"
+
+# Warn once per unsupported value (get_forced_llm_language is called at
+# every prompt site, so per-call logging would be too noisy).
+_unsupported_language_warnings: set = set()
 
 # English must win even when a surrounding Chinese prompt template asks
 # for Chinese field values, so the forced variant is stronger than the
@@ -81,10 +98,29 @@ def t(key: str, **kwargs) -> str:
 
 
 def get_forced_llm_language() -> Optional[str]:
-    """Return the run-level forced LLM output language, if any."""
+    """Return the run-level forced LLM output language, if any.
 
-    value = os.environ.get(FORCED_LLM_LANGUAGE_ENV, "").strip().lower()
-    return value or None
+    Region variants of the supported language are normalized to the
+    primary code ("en-US"/"en_US" -> "en"). Any other language is not
+    supported for run-level forcing (only English has full-pipeline
+    templates); it is rejected with a one-time warning and the run falls
+    back to locale-driven behavior instead of producing mixed-language
+    output.
+    """
+    raw = os.environ.get(FORCED_LLM_LANGUAGE_ENV, "").strip()
+    if not raw:
+        return None
+    primary = raw.replace("_", "-").split("-")[0].strip().lower()
+    if primary == SUPPORTED_FORCED_LLM_LANGUAGE:
+        return SUPPORTED_FORCED_LLM_LANGUAGE
+    if primary not in _unsupported_language_warnings:
+        _unsupported_language_warnings.add(primary)
+        logger.warning(
+            f"{FORCED_LLM_LANGUAGE_ENV}='{raw}' 不受支持：目前仅支持强制英文 'en'"
+            f"（区域变体如 en-US 会被归一化为 en）。其他语言没有完整的模板"
+            f"支持，强行生效会产生混合语言输出；已忽略该设置并回退到locale行为"
+        )
+    return None
 
 
 def is_english_forced() -> bool:
@@ -96,11 +132,11 @@ def is_english_forced() -> bool:
 def get_language_instruction() -> str:
     forced = get_forced_llm_language()
     if forced:
+        # Run-level forcing only supports English (region variants are
+        # normalized inside get_forced_llm_language; other languages are
+        # rejected there with a warning and fall through to locale).
         if forced == "en":
             return FORCED_ENGLISH_LLM_INSTRUCTION
-        forced_config = _languages.get(forced)
-        if forced_config:
-            return forced_config.get("llmInstruction", "")
     locale = get_locale()
     lang_config = _languages.get(locale, _languages.get('zh', {}))
     return lang_config.get('llmInstruction', '请使用中文回答。')

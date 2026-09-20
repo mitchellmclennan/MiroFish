@@ -54,6 +54,76 @@ def test_forced_english_helper_toggles_with_env(monkeypatch):
     assert is_english_forced()
 
 
+def test_english_region_variants_are_normalized_to_en(monkeypatch):
+    """评审L1：en-US/en_US此前静默不生效——区域变体必须归一化为en。"""
+    for value in ("en-US", "en_US", "EN-us", "en"):
+        monkeypatch.setenv("MIROFISH_LLM_LANGUAGE", value)
+        assert is_english_forced(), value
+        assert get_language_instruction() == FORCED_ENGLISH_LLM_INSTRUCTION
+
+
+def test_unsupported_forced_language_falls_back_with_warning(monkeypatch):
+    """评审L1：仅en有完整模板支持；强制其他语言必须显式告警并回退，
+    不得产生"外文指令+中文模板"的混合语言输出。"""
+    from app.utils import locale as locale_module
+
+    locale_module._unsupported_language_warnings.clear()
+
+    for value in ("fr", "es-MX", "de"):
+        monkeypatch.setenv("MIROFISH_LLM_LANGUAGE", value)
+        assert not is_english_forced(), value
+        # 回退到locale行为（默认中文）
+        assert get_language_instruction() == "请使用中文回答。"
+        # 不支持的语言值被记录（每个值只告警一次）
+        assert value.split("-")[0].lower() in locale_module._unsupported_language_warnings
+
+
+def test_rule_based_fallback_country_is_english_when_forced(monkeypatch):
+    """评审L1：英文强制运行的规则回退人设不得硬编码"中国"。"""
+    _force_english(monkeypatch)
+    generator = _make_generator()
+
+    org = generator._generate_profile_rule_based("neolife", "Organization", "summary", {})
+    media = generator._generate_profile_rule_based("Crunchbase", "MediaOutlet", "summary", {})
+
+    from app.services.oasis_profile_generator import OasisProfileGenerator
+
+    assert org["country"] in OasisProfileGenerator.COUNTRIES
+    assert media["country"] in OasisProfileGenerator.COUNTRIES
+
+
+def test_rule_based_fallback_country_stays_chinese_by_default(monkeypatch):
+    monkeypatch.delenv("MIROFISH_LLM_LANGUAGE", raising=False)
+    generator = _make_generator()
+
+    org = generator._generate_profile_rule_based("某机构", "Organization", "summary", {})
+    media = generator._generate_profile_rule_based("某媒体", "MediaOutlet", "summary", {})
+
+    assert org["country"] == "中国"
+    assert media["country"] == "中国"
+
+
+def test_reddit_profile_country_fallback_follows_language(monkeypatch, tmp_path):
+    """评审L1：reddit profile保存时的country缺省值不得在英文运行回填中文。"""
+    import json as json_module
+
+    from app.services.oasis_profile_generator import OasisAgentProfile
+
+    def _saved_country(generator, path):
+        profile = OasisAgentProfile(
+            user_id=0, user_name="u", name="n", bio="b", persona="p"
+        )
+        generator._save_reddit_json([profile], str(path))
+        return json_module.loads(path.read_text(encoding="utf-8"))[0]["country"]
+
+    _force_english(monkeypatch)
+    generator = _make_generator()
+    assert _saved_country(generator, tmp_path / "profiles_en.json") == "United States"
+
+    monkeypatch.delenv("MIROFISH_LLM_LANGUAGE", raising=False)
+    assert _saved_country(generator, tmp_path / "profiles_zh.json") == "中国"
+
+
 def _make_generator():
     from app.services.oasis_profile_generator import OasisProfileGenerator
 

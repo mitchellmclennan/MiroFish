@@ -354,6 +354,7 @@
     "scriptFileNotFound": "Script file not found: {name}",
     "requireGraphId": "Please provide graph_id",
     "noMatchingEntities": "No matching entities found",
+    "qualityFilterDroppedAllEntities": "No usable entities remain after quality filtering (all were classified as junk); see the entity_quality report in the returned data",
     "maxRoundsPositive": "max_rounds must be a positive integer",
     "maxRoundsInvalid": "max_rounds must be a valid integer",
     "invalidPlatform": "Invalid platform type: {platform}. Options: twitter/reddit/parallel",
