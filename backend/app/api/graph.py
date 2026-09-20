@@ -19,6 +19,7 @@ from ..services.text_processor import TextProcessor
 from ..utils.file_parser import FileParser
 from ..utils.logger import get_logger
 from ..utils.locale import t, get_locale, set_locale
+from ..utils.zep import is_local_zep_mode
 from ..utils.zep_lifecycle import get_graph_readers, graph_lifecycle_lock
 from ..models.task import TaskManager, TaskStatus
 from ..models.project import ProjectManager, ProjectStatus
@@ -546,14 +547,29 @@ def _build_graph_impl():
                 and project.zep_batch_id
                 and project.zep_batch_operation_id
             ):
-                builder = GraphBuilderService(api_key=Config.ZEP_API_KEY)
-                batch_summary = builder.get_batch_summary(project.zep_batch_id)
-                if getattr(batch_summary, "status", None) in {
-                    "queued",
-                    "processing",
-                    "succeeded",
-                }:
-                    resume_existing_batch = True
+                # Only the Cloud Batch API can reconcile a crashed build from
+                # server-side state. The local OpenZep path fabricates its
+                # batch id ("openzep-<operation_id>") and keeps episode uuids
+                # only in memory, so it can never be resumed: skip the
+                # batch.get the local server does not implement and fall
+                # through to the designed recoverable 409 below.
+                if not is_local_zep_mode():
+                    builder = GraphBuilderService(api_key=Config.ZEP_API_KEY)
+                    try:
+                        batch_summary = builder.get_batch_summary(
+                            project.zep_batch_id
+                        )
+                    except NotFoundError:
+                        # A batch that no longer exists on the server is a
+                        # permanent condition: degrade to the designed
+                        # recoverable 409 instead of an unhandled 500.
+                        batch_summary = None
+                    if getattr(batch_summary, "status", None) in {
+                        "queued",
+                        "processing",
+                        "succeeded",
+                    }:
+                        resume_existing_batch = True
 
             if not resume_existing_batch:
                 project.status = ProjectStatus.FAILED

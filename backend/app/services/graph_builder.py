@@ -4,6 +4,10 @@
 """
 
 import hashlib
+import json
+import socket
+import urllib.error
+import urllib.request
 import uuid
 import time
 import threading
@@ -14,6 +18,7 @@ from zep_cloud import BatchAddItem, EntityEdgeSourceTarget, NotFoundError
 
 from ..config import Config
 from ..models.task import TaskManager, TaskStatus
+from ..utils.logger import get_logger
 from ..utils.zep_paging import fetch_all_nodes, fetch_all_edges
 from ..utils.ontology import (
     MAX_ONTOLOGY_TYPES,
@@ -24,11 +29,51 @@ from ..utils.ontology import (
 from ..utils.zep import (
     ZEP_INGESTION_WAIT_TIMEOUT_SECONDS,
     call_zep_read_with_retry,
+    get_zep_base_url,
     get_zep_client,
+    is_local_zep_mode,
     is_retryable_zep_error,
 )
 from .text_processor import TextProcessor
 from ..utils.locale import t, get_locale, set_locale
+
+logger = get_logger("mirofish.graph_builder")
+
+# --- Local OpenZep (/graph-batch) request policy -------------------------
+# Bounded retries for the direct POST: only failures that prove the request
+# was NOT accepted may be replayed; anything ambiguous (read timeout, 5xx,
+# reset mid-flight) fails fast so a replay can never duplicate episodes.
+ZEP_GRAPH_BATCH_MAX_ATTEMPTS = 3
+ZEP_GRAPH_BATCH_INITIAL_DELAY_SECONDS = 2.0
+# Episode poll statuses that are permanent by HTTP contract: the episode is
+# gone (404/410) or the request itself can never succeed (other 4xx except
+# 408/429). These fail the build immediately instead of spinning until the
+# ingestion timeout.
+EPISODE_POLL_PERMANENT_HTTP_STATUSES = frozenset({400, 401, 403, 404, 405, 410})
+
+
+class PermanentEpisodePollError(RuntimeError):
+    """An episode poll failed with a permanent HTTP status (e.g. 404/410)."""
+
+
+def _is_undelivered_post_error(error: BaseException) -> bool:
+    """Classify a /graph-batch POST failure as provably safe to replay.
+
+    Only failures that guarantee the server never accepted the request are
+    retryable: connection-refused/DNS URLError (the request could not be
+    delivered) and HTTP 429 (the server explicitly rejected and did not
+    process it). Read timeouts, resets mid-flight, and 5xx replies are
+    ambiguous — the server may have accepted and ingested the group — and
+    must fail fast instead of replaying.
+    """
+
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code == 429
+    if isinstance(error, urllib.error.URLError):
+        return isinstance(
+            error.reason, (ConnectionRefusedError, socket.gaierror)
+        )
+    return False
 
 
 @dataclass
@@ -412,7 +457,37 @@ class GraphBuilderService:
         progress_callback: Optional[Callable] = None,
         batch_created_callback: Optional[Callable[[str | None, str], None]] = None,
     ) -> BatchSubmission:
-        """Submit document chunks through Zep's current Batch API.
+        """Submit document chunks through the configured Zep ingestion path.
+
+        ZEP_MODE selects the protocol (see app.utils.zep):
+
+        * ``cloud`` (default) — Zep Cloud Batch API (client.batch.create /
+          add / process) with timeout reconciliation and no-replay
+          guarantees.
+        * ``local`` — local OpenZep server: direct ``/graph-batch`` POSTs
+          with the same authentication as the SDK path, bounded retries on
+          provably-undelivered failures, and fail-fast on ambiguous ones.
+        """
+
+        if not graph_id:
+            raise ValueError("graph_id is required")
+        if is_local_zep_mode():
+            return self._add_text_batches_local(
+                graph_id, chunks, batch_size, progress_callback, batch_created_callback
+            )
+        return self._add_text_batches_cloud(
+            graph_id, chunks, batch_size, progress_callback, batch_created_callback
+        )
+
+    def _add_text_batches_cloud(
+        self,
+        graph_id: str,
+        chunks: List[str],
+        batch_size: int = 350,
+        progress_callback: Optional[Callable] = None,
+        batch_created_callback: Optional[Callable[[str | None, str], None]] = None,
+    ) -> BatchSubmission:
+        """Submit document chunks through Zep Cloud's Batch API.
 
         Mutating calls are deliberately not retried: create/add are not
         documented as idempotent, and an ambiguous replay can duplicate graph
@@ -420,8 +495,6 @@ class GraphBuilderService:
         reconcile the operation instead.
         """
 
-        if not graph_id:
-            raise ValueError("graph_id is required")
         self.validate_batch_chunks(chunks, batch_size=batch_size)
 
         total_chunks = len(chunks)
@@ -459,14 +532,14 @@ class GraphBuilderService:
             batch_chunks = chunks[i:i + batch_size]
             batch_num = i // batch_size + 1
             total_batches = (total_chunks + batch_size - 1) // batch_size
-            
+
             if progress_callback:
                 progress = (i + len(batch_chunks)) / total_chunks
                 progress_callback(
                     t('progress.sendingBatch', current=batch_num, total=total_batches, chunks=len(batch_chunks)),
                     progress
                 )
-            
+
             items = [
                 BatchAddItem(
                     type="graph_episode",
@@ -563,6 +636,152 @@ class GraphBuilderService:
             item_count=total_chunks,
         )
 
+    def _add_text_batches_local(
+        self,
+        graph_id: str,
+        chunks: List[str],
+        batch_size: int = 350,
+        progress_callback: Optional[Callable] = None,
+        batch_created_callback: Optional[Callable[[str | None, str], None]] = None,
+    ) -> BatchSubmission:
+        """OpenZep local path: post chunks via /graph-batch.
+
+        Zep Cloud's Batch API (client.batch.*) is not implemented by the
+        local OpenZep server, so chunks go straight to /graph-batch, which
+        returns per-episode uuids tracked by /graph/episodes/{uuid}.
+
+        Idempotency policy: episode names are deterministic per (graph_id,
+        chunk payload), but the local server offers no dedup contract, so a
+        failed group POST is replayed only when the failure proves the
+        request was never delivered (connection refused, DNS, 429). Ambiguous
+        failures (read timeout, 5xx, mid-flight reset) fail the build
+        immediately; recovery is a forced rebuild, which deletes the partial
+        graph before re-ingesting.
+        """
+        self.validate_batch_chunks(chunks, batch_size=batch_size)
+        total_chunks = len(chunks)
+        operation_id = self.build_operation_id(graph_id, chunks)
+        batch_id = f"openzep-{operation_id}"
+        if batch_created_callback:
+            batch_created_callback(batch_id, operation_id)
+        base_url = get_zep_base_url()
+        episode_uuids: List[str] = []
+        per_request = min(batch_size, 10)
+        for i in range(0, total_chunks, per_request):
+            group = chunks[i:i + per_request]
+            group_index = i // per_request + 1
+            if progress_callback:
+                progress_callback(
+                    t('progress.sendingBatch',
+                      current=group_index,
+                      total=(total_chunks + per_request - 1) // per_request,
+                      chunks=len(group)),
+                    (i + len(group)) / total_chunks,
+                )
+            payload = {
+                "graph_id": graph_id,
+                "episodes": [
+                    {
+                        "name": f"{operation_id}-{i + offset}",
+                        "data": chunk,
+                        "type": "text",
+                        "source_description": "MiroFish source document chunk",
+                    }
+                    for offset, chunk in enumerate(group)
+                ],
+            }
+            body = self._post_graph_batch_group(base_url, payload, group_index)
+            items = body if isinstance(body, list) else body.get("episodes", [])
+            for ep in items:
+                uid = ep.get("uuid_") or ep.get("uuid")
+                if uid:
+                    episode_uuids.append(uid)
+        if len(episode_uuids) != total_chunks:
+            raise RuntimeError(
+                f"OpenZep graph-batch returned {len(episode_uuids)} episode uuids, "
+                f"expected {total_chunks}"
+            )
+        return BatchSubmission(
+            batch_id=batch_id,
+            operation_id=operation_id,
+            episode_uuids=episode_uuids,
+            item_count=total_chunks,
+        )
+
+    def _direct_zep_auth_headers(self) -> Dict[str, str]:
+        """Auth headers for direct OpenZep HTTP requests.
+
+        The direct /graph-batch path must perform the same authentication
+        the SDK path performs, so a server that enforces the key (or a
+        future switch back to Cloud) cannot fail opaquely.
+        """
+
+        api_key = (getattr(self, "api_key", None) or Config.ZEP_API_KEY or "").strip()
+        if not api_key:
+            raise ValueError("ZEP_API_KEY 未配置")
+        return {"Authorization": f"Bearer {api_key}"}
+
+    def _post_graph_batch_group(
+        self,
+        base_url: str,
+        payload: Dict[str, Any],
+        group_index: int,
+    ) -> Any:
+        """POST one chunk group to /graph-batch with a bounded replay policy.
+
+        Retries are bounded (ZEP_GRAPH_BATCH_MAX_ATTEMPTS) and restricted to
+        failures that prove the request was never accepted by the server.
+        Ambiguous failures fail immediately — replaying them could duplicate
+        episodes because /graph-batch has no idempotency contract.
+        """
+
+        data = json.dumps(payload).encode("utf-8")
+        last_error: BaseException | None = None
+        attempt = 0
+        for attempt in range(1, ZEP_GRAPH_BATCH_MAX_ATTEMPTS + 1):
+            req = urllib.request.Request(
+                base_url + "/graph-batch",
+                data=data,
+                headers={
+                    "Content-Type": "application/json",
+                    **self._direct_zep_auth_headers(),
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=600) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except Exception as error:
+                last_error = error
+                if not _is_undelivered_post_error(error):
+                    raise RuntimeError(
+                        f"OpenZep /graph-batch POST for group {group_index} "
+                        f"failed with {type(error).__name__}: {error}. The "
+                        "failure may be ambiguous (the group may have been "
+                        "accepted), so it was NOT replayed to avoid duplicate "
+                        "episodes. Rebuild with force=true; the partial graph "
+                        "is deleted first."
+                    ) from error
+                if attempt == ZEP_GRAPH_BATCH_MAX_ATTEMPTS:
+                    break
+                delay = ZEP_GRAPH_BATCH_INITIAL_DELAY_SECONDS * (2 ** (attempt - 1))
+                logger.warning(
+                    "OpenZep /graph-batch group %s attempt %s/%s failed (%s); "
+                    "request was not delivered, retrying in %.1fs",
+                    group_index,
+                    attempt,
+                    ZEP_GRAPH_BATCH_MAX_ATTEMPTS,
+                    type(error).__name__,
+                    delay,
+                )
+                time.sleep(delay)
+        raise RuntimeError(
+            f"OpenZep /graph-batch POST for group {group_index} failed after "
+            f"{attempt} attempt(s): {last_error}. The request was never "
+            "delivered; check the local OpenZep server availability and "
+            "rebuild with force=true."
+        ) from last_error
+
     @staticmethod
     def validate_batch_chunks(chunks: List[str], *, batch_size: int = 350) -> None:
         """Validate every Batch API limit before the first Cloud mutation."""
@@ -629,6 +848,18 @@ class GraphBuilderService:
         )
 
     def _wait_for_batch(
+        self,
+        submission: BatchSubmission,
+        progress_callback: Optional[Callable] = None,
+        timeout: int | None = None,
+    ) -> List[str]:
+        """Wait for ingestion to finish under the configured Zep mode."""
+
+        if is_local_zep_mode():
+            return self._wait_for_batch_local(submission, progress_callback, timeout)
+        return self._wait_for_batch_cloud(submission, progress_callback, timeout)
+
+    def _wait_for_batch_cloud(
         self,
         submission: BatchSubmission,
         progress_callback: Optional[Callable] = None,
@@ -716,7 +947,77 @@ class GraphBuilderService:
                 1.0,
             )
         return episode_uuids
-    
+
+    def _wait_for_batch_local(
+        self,
+        submission: BatchSubmission,
+        progress_callback: Optional[Callable] = None,
+        timeout: int | None = None,
+    ) -> List[str]:
+        """OpenZep local path: poll /graph/episodes/{uuid} processed flags.
+
+        Permanent poll failures (episode 404/410 and other non-retryable
+        4xx statuses) fail the build immediately instead of spinning until
+        the ingestion timeout; transient failures (transport errors, 5xx,
+        408/429) keep polling.
+        """
+        timeout = timeout or ZEP_INGESTION_WAIT_TIMEOUT_SECONDS
+        start_time = time.time()
+        base_url = get_zep_base_url()
+        # Resolve auth once, before the loop: a missing key is a permanent
+        # configuration error and must not be swallowed by the per-episode
+        # transient-error handling below.
+        auth_headers = self._direct_zep_auth_headers()
+        pending = set(submission.episode_uuids)
+        done: List[str] = []
+        while pending:
+            if time.time() - start_time > timeout:
+                raise TimeoutError(
+                    f"OpenZep ingestion {submission.batch_id} did not finish within {timeout}s"
+                )
+            for uid in list(pending):
+                try:
+                    req = urllib.request.Request(
+                        base_url + "/graph/episodes/" + uid,
+                        headers=dict(auth_headers),
+                        method="GET",
+                    )
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        body = json.loads(resp.read().decode("utf-8"))
+                    if body.get("processed"):
+                        pending.discard(uid)
+                        done.append(uid)
+                except urllib.error.HTTPError as error:
+                    if error.code in EPISODE_POLL_PERMANENT_HTTP_STATUSES:
+                        raise PermanentEpisodePollError(
+                            f"OpenZep episode {uid} poll returned permanent "
+                            f"HTTP {error.code}; the episode is gone or the "
+                            "poll request can never succeed"
+                        ) from error
+                    # 408/429/5xx responses are transient: keep polling.
+                except Exception:
+                    # Transport-level failures (e.g. the server restarting)
+                    # stay retryable by the next poll cycle.
+                    pass
+            if progress_callback:
+                progress_callback(
+                    t('progress.zepProcessing',
+                      completed=len(done),
+                      total=submission.item_count,
+                      pending=len(pending),
+                      elapsed=int(time.time() - start_time)),
+                    len(done) / max(submission.item_count, 1),
+                )
+            if pending:
+                time.sleep(5)
+        if progress_callback:
+            progress_callback(
+                t('progress.processingComplete', completed=len(done),
+                  total=submission.item_count),
+                1.0,
+            )
+        return done
+
     def _wait_for_episodes(
         self,
         episode_uuids: List[str],

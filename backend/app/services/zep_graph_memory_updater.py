@@ -12,7 +12,7 @@ from queue import Queue, Empty
 
 from ..config import Config
 from ..utils.logger import get_logger
-from ..utils.locale import get_locale, set_locale
+from ..utils.locale import get_locale, is_english_forced, set_locale
 from ..utils.zep import (
     ZEP_INGESTION_WAIT_TIMEOUT_SECONDS,
     call_zep_read_with_retry,
@@ -39,6 +39,9 @@ class AgentActivity:
         
         采用自然语言描述格式，让Zep能够从中提取实体和关系
         不添加模拟相关的前缀，避免误导图谱更新
+        
+        当运行被强制为英文（MIROFISH_LLM_LANGUAGE=en）时，动作描述
+        使用英文模板，避免中文片段混入英文图谱的实体抽取。
         """
         # 根据不同的动作类型生成不同的描述
         action_descriptions = {
@@ -68,6 +71,10 @@ class AgentActivity:
     
     def _describe_create_post(self) -> str:
         content = self.action_args.get("content", "")
+        if is_english_forced():
+            if content:
+                return f"posted: \"{content}\""
+            return "posted a new post"
         if content:
             return f"发布了一条帖子：「{content}」"
         return "发布了一条帖子"
@@ -76,6 +83,15 @@ class AgentActivity:
         """点赞帖子 - 包含帖子原文和作者信息"""
         post_content = self.action_args.get("post_content", "")
         post_author = self.action_args.get("post_author_name", "")
+        
+        if is_english_forced():
+            if post_content and post_author:
+                return f"liked {post_author}'s post: \"{post_content}\""
+            elif post_content:
+                return f"liked a post: \"{post_content}\""
+            elif post_author:
+                return f"liked a post by {post_author}"
+            return "liked a post"
         
         if post_content and post_author:
             return f"点赞了{post_author}的帖子：「{post_content}」"
@@ -90,6 +106,15 @@ class AgentActivity:
         post_content = self.action_args.get("post_content", "")
         post_author = self.action_args.get("post_author_name", "")
         
+        if is_english_forced():
+            if post_content and post_author:
+                return f"disliked {post_author}'s post: \"{post_content}\""
+            elif post_content:
+                return f"disliked a post: \"{post_content}\""
+            elif post_author:
+                return f"disliked a post by {post_author}"
+            return "disliked a post"
+        
         if post_content and post_author:
             return f"踩了{post_author}的帖子：「{post_content}」"
         elif post_content:
@@ -102,6 +127,15 @@ class AgentActivity:
         """转发帖子 - 包含原帖内容和作者信息"""
         original_content = self.action_args.get("original_content", "")
         original_author = self.action_args.get("original_author_name", "")
+        
+        if is_english_forced():
+            if original_content and original_author:
+                return f"reposted {original_author}'s post: \"{original_content}\""
+            elif original_content:
+                return f"reposted a post: \"{original_content}\""
+            elif original_author:
+                return f"reposted a post by {original_author}"
+            return "reposted a post"
         
         if original_content and original_author:
             return f"转发了{original_author}的帖子：「{original_content}」"
@@ -116,6 +150,20 @@ class AgentActivity:
         original_content = self.action_args.get("original_content", "")
         original_author = self.action_args.get("original_author_name", "")
         quote_content = self.action_args.get("quote_content", "") or self.action_args.get("content", "")
+        
+        if is_english_forced():
+            if original_content and original_author:
+                base = f"quoted {original_author}'s post: \"{original_content}\""
+            elif original_content:
+                base = f"quoted a post: \"{original_content}\""
+            elif original_author:
+                base = f"quoted a post by {original_author}"
+            else:
+                base = "quoted a post"
+            
+            if quote_content:
+                base += f", commenting: \"{quote_content}\""
+            return base
         
         base = ""
         if original_content and original_author:
@@ -135,6 +183,11 @@ class AgentActivity:
         """关注用户 - 包含被关注用户的名称"""
         target_user_name = self.action_args.get("target_user_name", "")
         
+        if is_english_forced():
+            if target_user_name:
+                return f"followed the user \"{target_user_name}\""
+            return "followed a user"
+        
         if target_user_name:
             return f"关注了用户「{target_user_name}」"
         return "关注了一个用户"
@@ -144,6 +197,17 @@ class AgentActivity:
         content = self.action_args.get("content", "")
         post_content = self.action_args.get("post_content", "")
         post_author = self.action_args.get("post_author_name", "")
+        
+        if is_english_forced():
+            if content:
+                if post_content and post_author:
+                    return f"commented on {post_author}'s post \"{post_content}\": \"{content}\""
+                elif post_content:
+                    return f"commented on the post \"{post_content}\": \"{content}\""
+                elif post_author:
+                    return f"commented on {post_author}'s post: \"{content}\""
+                return f"commented: \"{content}\""
+            return "wrote a comment"
         
         if content:
             if post_content and post_author:
@@ -160,6 +224,15 @@ class AgentActivity:
         comment_content = self.action_args.get("comment_content", "")
         comment_author = self.action_args.get("comment_author_name", "")
         
+        if is_english_forced():
+            if comment_content and comment_author:
+                return f"liked {comment_author}'s comment: \"{comment_content}\""
+            elif comment_content:
+                return f"liked a comment: \"{comment_content}\""
+            elif comment_author:
+                return f"liked a comment by {comment_author}"
+            return "liked a comment"
+        
         if comment_content and comment_author:
             return f"点赞了{comment_author}的评论：「{comment_content}」"
         elif comment_content:
@@ -173,6 +246,15 @@ class AgentActivity:
         comment_content = self.action_args.get("comment_content", "")
         comment_author = self.action_args.get("comment_author_name", "")
         
+        if is_english_forced():
+            if comment_content and comment_author:
+                return f"disliked {comment_author}'s comment: \"{comment_content}\""
+            elif comment_content:
+                return f"disliked a comment: \"{comment_content}\""
+            elif comment_author:
+                return f"disliked a comment by {comment_author}"
+            return "disliked a comment"
+        
         if comment_content and comment_author:
             return f"踩了{comment_author}的评论：「{comment_content}」"
         elif comment_content:
@@ -184,16 +266,25 @@ class AgentActivity:
     def _describe_search(self) -> str:
         """搜索帖子 - 包含搜索关键词"""
         query = self.action_args.get("query", "") or self.action_args.get("keyword", "")
+        if is_english_forced():
+            return f"searched for \"{query}\"" if query else "performed a search"
         return f"搜索了「{query}」" if query else "进行了搜索"
     
     def _describe_search_user(self) -> str:
         """搜索用户 - 包含搜索关键词"""
         query = self.action_args.get("query", "") or self.action_args.get("username", "")
+        if is_english_forced():
+            return f"searched for the user \"{query}\"" if query else "searched for a user"
         return f"搜索了用户「{query}」" if query else "搜索了用户"
     
     def _describe_mute(self) -> str:
         """屏蔽用户 - 包含被屏蔽用户的名称"""
         target_user_name = self.action_args.get("target_user_name", "")
+        
+        if is_english_forced():
+            if target_user_name:
+                return f"muted the user \"{target_user_name}\""
+            return "muted a user"
         
         if target_user_name:
             return f"屏蔽了用户「{target_user_name}」"
@@ -201,6 +292,8 @@ class AgentActivity:
     
     def _describe_generic(self) -> str:
         # 对于未知的动作类型，生成通用描述
+        if is_english_forced():
+            return f"performed the {self.action_type} action"
         return f"执行了{self.action_type}操作"
 
 

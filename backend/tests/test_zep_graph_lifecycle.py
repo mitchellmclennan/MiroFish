@@ -209,6 +209,8 @@ def test_stale_build_resumes_a_persisted_processing_batch(monkeypatch):
         def start(self):
             pass
 
+    monkeypatch.setenv("ZEP_MODE", "cloud")
+    monkeypatch.delenv("ZEP_BASE_URL", raising=False)
     monkeypatch.setattr(graph_api.Config, "ZEP_API_KEY", "test-key")
     monkeypatch.setattr(graph_api, "TaskManager", Tasks)
     monkeypatch.setattr(graph_api, "GraphBuilderService", Builder)
@@ -242,6 +244,107 @@ def test_stale_build_resumes_a_persisted_processing_batch(monkeypatch):
     assert body["data"]["task_id"] == "task-resumed"
     assert project.graph_build_task_id == "task-resumed"
     assert len(created_threads) == 1
+
+
+def test_local_crash_resume_returns_recoverable_409_without_batch_get(monkeypatch):
+    """H1：local模式下崩溃恢复绝不调用Cloud batch.get，直接落到设计的可恢复409。"""
+
+    project = _project(ProjectStatus.GRAPH_BUILDING)
+    project.zep_batch_id = "openzep-operation-1"
+    saved = []
+
+    class ForbiddenBuilder:
+        def __init__(self, **_kwargs):
+            raise AssertionError(
+                "local mode must not construct GraphBuilderService for resume"
+            )
+
+        def get_batch_summary(self, _batch_id):
+            raise AssertionError("local mode must not call batch.get")
+
+    monkeypatch.setenv("ZEP_MODE", "local")
+    monkeypatch.setenv("ZEP_BASE_URL", "http://localhost:8000/api/v2")
+    monkeypatch.setattr(graph_api.Config, "ZEP_API_KEY", "test-key")
+    monkeypatch.setattr(graph_api, "GraphBuilderService", ForbiddenBuilder)
+    monkeypatch.setattr(
+        graph_api.ProjectManager,
+        "get_project",
+        classmethod(lambda _cls, _project_id: project),
+    )
+    monkeypatch.setattr(
+        graph_api.ProjectManager,
+        "save_project",
+        classmethod(lambda _cls, value: saved.append(value.status)),
+    )
+    monkeypatch.setattr(
+        graph_api,
+        "TaskManager",
+        lambda: SimpleNamespace(get_task=lambda _task_id: None),
+    )
+
+    app = Flask(__name__)
+    with app.test_request_context(
+        "/api/graph/build",
+        method="POST",
+        json={"project_id": "proj-1"},
+    ):
+        body, status = _json_result(graph_api.build_graph())
+
+    assert status == 409
+    assert body["recoverable"] is True
+    assert body["task_id"] == "task-1"
+    assert project.status == ProjectStatus.FAILED
+    assert saved == [ProjectStatus.FAILED]
+
+
+def test_cloud_crash_resume_degrades_missing_batch_to_recoverable_409(monkeypatch):
+    """H1：Cloud模式下batch.get 404（batch已在服务端消失）降级为设计的409而非500。"""
+
+    from zep_cloud import NotFoundError
+
+    project = _project(ProjectStatus.GRAPH_BUILDING)
+    saved = []
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        def get_batch_summary(self, batch_id):
+            assert batch_id == "batch-1"
+            raise NotFoundError(body={"message": "batch not found"})
+
+    monkeypatch.setenv("ZEP_MODE", "cloud")
+    monkeypatch.delenv("ZEP_BASE_URL", raising=False)
+    monkeypatch.setattr(graph_api.Config, "ZEP_API_KEY", "test-key")
+    monkeypatch.setattr(graph_api, "GraphBuilderService", Builder)
+    monkeypatch.setattr(
+        graph_api.ProjectManager,
+        "get_project",
+        classmethod(lambda _cls, _project_id: project),
+    )
+    monkeypatch.setattr(
+        graph_api.ProjectManager,
+        "save_project",
+        classmethod(lambda _cls, value: saved.append(value.status)),
+    )
+    monkeypatch.setattr(
+        graph_api,
+        "TaskManager",
+        lambda: SimpleNamespace(get_task=lambda _task_id: None),
+    )
+
+    app = Flask(__name__)
+    with app.test_request_context(
+        "/api/graph/build",
+        method="POST",
+        json={"project_id": "proj-1"},
+    ):
+        body, status = _json_result(graph_api.build_graph())
+
+    assert status == 409
+    assert body["recoverable"] is True
+    assert project.status == ProjectStatus.FAILED
+    assert saved == [ProjectStatus.FAILED]
 
 
 def test_project_delete_removes_cloud_graph_before_local_files(monkeypatch):

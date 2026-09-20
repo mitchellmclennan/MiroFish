@@ -545,6 +545,7 @@ class TwitterSimulationRunner:
         time_config = self.config.get("time_config", {})
         total_hours = time_config.get("total_simulation_hours", 72)
         minutes_per_round = time_config.get("minutes_per_round", 30)
+        start_hour = time_config.get("start_hour", 0)
         
         # 计算总轮数
         total_rounds = (total_hours * 60) // minutes_per_round
@@ -633,7 +634,7 @@ class TwitterSimulationRunner:
         for round_num in range(total_rounds):
             # 计算当前模拟时间
             simulated_minutes = round_num * minutes_per_round
-            simulated_hour = (simulated_minutes // 60) % 24
+            simulated_hour = (start_hour + simulated_minutes // 60) % 24
             simulated_day = simulated_minutes // (60 * 24) + 1
             
             # 获取本轮激活的Agent
