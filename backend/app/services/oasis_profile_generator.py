@@ -24,9 +24,11 @@ from ..utils.openai_chat_compat import create_chat_completion, extract_chat_comp
 from ..utils.zep import (
     call_zep_read_with_retry,
     get_zep_client,
+    is_local_zep_mode,
     is_retryable_zep_error,
     normalize_zep_search_query,
 )
+from ..utils.zep_local_search import local_graph_search
 from .zep_entity_reader import EntityNode, ZepEntityReader
 
 logger = get_logger('mirofish.oasis_profile')
@@ -518,6 +520,38 @@ class OasisProfileGenerator:
                 seen.add(summary)
         return summaries
 
+    def _scoped_graph_search(self, *, query: str, limit: int, scope: str):
+        """按当前部署模式执行限定在当前图谱内的搜索。
+
+        - Cloud模式：保持SDK调用原样（graph_id + scope + rrf），行为
+          与历史版本完全一致，不受本地适配逻辑影响。
+        - Local模式（ZEP_MODE=local）：本地OpenZep的/graph/search忽略
+          graph_id和scope，只有session_id会限定搜索范围——否则搜索
+          会跨越服务器上的所有图谱，把旧图谱的事实（IDIA、NVIDIA、
+          Instagram等）混进新人设。因此本地模式直传本地契约：
+          session_id=<graph_id>。鉴权、超时、查询/结果上限与SDK路径
+          一致（见 utils/zep_local_search.py）。
+
+        Returns:
+            Cloud: zep-cloud SDK的GraphSearchResults；
+            Local: 本地payload的LocalGraphSearchResults（.results事实dict）。
+        """
+        if is_local_zep_mode():
+            return local_graph_search(
+                query=query,
+                graph_id=self.graph_id,
+                limit=limit,
+                # 与SDK路径相同的鉴权来源：实例可注入自定义key
+                api_key=getattr(self, "zep_api_key", None),
+            )
+        return self.zep_client.graph.search(
+            query=query,
+            graph_id=self.graph_id,
+            limit=limit,
+            scope=scope,
+            reranker="rrf"
+        )
+
     def _search_zep_for_entity(self, entity: EntityNode) -> Dict[str, Any]:
         """
         使用Zep图谱混合搜索功能获取实体相关的丰富信息
@@ -573,12 +607,8 @@ class OasisProfileGenerator:
         def search_edges():
             """搜索边（事实/关系）- 带重试机制"""
             return call_zep_read_with_retry(
-                lambda: self.zep_client.graph.search(
-                        query=comprehensive_query,
-                        graph_id=self.graph_id,
-                        limit=30,
-                        scope="edges",
-                        reranker="rrf"
+                lambda: self._scoped_graph_search(
+                    query=comprehensive_query, limit=30, scope="edges"
                 ),
                 operation_name=f"profile edge search ({entity.uuid})",
             )
@@ -586,12 +616,8 @@ class OasisProfileGenerator:
         def search_nodes():
             """搜索节点（实体摘要）- 带重试机制"""
             return call_zep_read_with_retry(
-                lambda: self.zep_client.graph.search(
-                        query=comprehensive_query,
-                        graph_id=self.graph_id,
-                        limit=20,
-                        scope="nodes",
-                        reranker="rrf"
+                lambda: self._scoped_graph_search(
+                    query=comprehensive_query, limit=20, scope="nodes"
                 ),
                 operation_name=f"profile node search ({entity.uuid})",
             )

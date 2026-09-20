@@ -56,7 +56,10 @@ def _http_error(status: int) -> urllib.error.HTTPError:
     )
 
 
-def test_report_search_caps_the_query_sent_to_zep():
+def test_report_search_caps_the_query_sent_to_zep(monkeypatch):
+    """Cloud SDK搜索契约：查询必须按上限截断后发给SDK。"""
+
+    _cloud_mode(monkeypatch)
     calls = []
 
     class GraphApi:
@@ -74,7 +77,10 @@ def test_report_search_caps_the_query_sent_to_zep():
     assert result.query == original_query
 
 
-def test_profile_context_search_caps_both_queries_sent_to_zep():
+def test_profile_context_search_caps_both_queries_sent_to_zep(monkeypatch):
+    """Cloud SDK搜索契约：两次上下文检索的查询都必须按上限截断。"""
+
+    _cloud_mode(monkeypatch)
     calls = []
 
     class GraphApi:

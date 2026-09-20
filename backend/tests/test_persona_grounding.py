@@ -128,6 +128,22 @@ def _no_forced_language_by_default(monkeypatch):
     monkeypatch.delenv("MIROFISH_LLM_LANGUAGE", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _cloud_sdk_mode_by_default(monkeypatch):
+    """Pin Zep Cloud mode for the SDK-contract doubles in this file.
+
+    FakeZepSearchClient stands in for the zep-cloud SDK client, so these
+    tests assert the Cloud contract. The ambient ZEP_MODE loaded from the
+    repo .env at import time may be ``local`` (this machine runs the local
+    OpenZep server), which would dispatch retrieval to the local
+    /graph/search adapter instead of the SDK. Local-mode retrieval has its
+    own dedicated tests (tests/test_zep_local_search.py).
+    """
+
+    monkeypatch.setenv("ZEP_MODE", "cloud")
+    monkeypatch.delenv("ZEP_BASE_URL", raising=False)
+
+
 def test_openzep_local_search_shape_is_consumed(monkeypatch):
     """OpenZep local returns facts under ``results``; they must be used."""
     edge_response, node_response = _openzep_search_responses(

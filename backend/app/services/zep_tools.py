@@ -22,9 +22,11 @@ from ..utils.zep_paging import fetch_all_nodes, fetch_all_edges
 from ..utils.zep import (
     call_zep_read_with_retry,
     get_zep_client,
+    is_local_zep_mode,
     normalize_zep_search_limit,
     normalize_zep_search_query,
 )
+from ..utils.zep_local_search import local_graph_search
 
 logger = get_logger('mirofish.zep_tools')
 
@@ -481,15 +483,33 @@ class ZepToolsService:
         zep_query = normalize_zep_search_query(query)
         zep_limit = normalize_zep_search_limit(limit)
 
+        def perform_search():
+            """按部署模式执行带作用域的搜索。
+
+            Cloud模式保持SDK调用原样（graph_id+scope+cross_encoder）。
+            Local模式：本地OpenZep的/graph/search忽略graph_id和scope，
+            只有session_id限定搜索范围；直传本地契约（session_id=
+            <graph_id>）避免跨所有图谱检索污染报告上下文。
+            """
+            if is_local_zep_mode():
+                return local_graph_search(
+                    query=zep_query,
+                    graph_id=graph_id,
+                    limit=zep_limit,
+                    # 与SDK路径相同的鉴权来源：实例可注入自定义key
+                    api_key=getattr(self, "api_key", None),
+                )
+            return self.client.graph.search(
+                graph_id=graph_id,
+                query=zep_query,
+                limit=zep_limit,
+                scope=scope,
+                reranker="cross_encoder"
+            )
+
         try:
             search_results = self._call_with_retry(
-                func=lambda: self.client.graph.search(
-                    graph_id=graph_id,
-                    query=zep_query,
-                    limit=zep_limit,
-                    scope=scope,
-                    reranker="cross_encoder"
-                ),
+                func=perform_search,
                 operation_name=t("console.graphSearchOp", graphId=graph_id)
             )
             
@@ -522,6 +542,23 @@ class ZepToolsService:
                     # 节点摘要也算作事实
                     if hasattr(node, 'summary') and node.summary:
                         facts.append(f"[{node.name}]: {node.summary}")
+
+            # 解析OpenZep本地结果（.results事实dict）。本地契约没有
+            # edges/nodes scope——每条结果都是边事实；此前本地报告搜索
+            # 只读.edges/.nodes，本地结果被静默丢弃为空。
+            for item in (getattr(search_results, 'results', None) or []):
+                if not isinstance(item, dict):
+                    continue
+                fact = item.get("fact")
+                if isinstance(fact, str) and fact.strip():
+                    facts.append(fact)
+                    edges.append({
+                        "uuid": item.get("uuid", ""),
+                        "name": item.get("name", ""),
+                        "fact": fact,
+                        "source_node_uuid": item.get("source_node_uuid", ""),
+                        "target_node_uuid": item.get("target_node_uuid", ""),
+                    })
             
             logger.info(t("console.searchComplete", count=len(facts)))
             
